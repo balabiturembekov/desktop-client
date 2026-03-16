@@ -20,6 +20,13 @@ pub struct CloseRequestedPayload {
     pub timer_running: bool,
 }
 
+/// Прогресс скачивания обновления
+#[derive(Serialize, Clone)]
+pub struct UpdateProgressPayload {
+    pub downloaded: u64,
+    pub total: u64,
+}
+
 #[tauri::command]
 pub async fn cmd_login(
     email: String,
@@ -129,6 +136,48 @@ pub async fn cmd_update_tray_status(
     }
 
     Ok(())
+}
+
+/// Скачивает и устанавливает доступное обновление.
+/// Прогресс передаётся через emit "update-progress".
+/// После установки перезапускает приложение.
+#[tauri::command]
+pub async fn cmd_download_and_install(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Emitter;
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+
+    log::info!("[updater] downloading update {}", update.version);
+
+    let app_for_progress = app.clone();
+    update
+        .download_and_install(
+            move |downloaded, total| {
+                let _ = app_for_progress.emit(
+                    "update-progress",
+                    UpdateProgressPayload {
+                        downloaded: downloaded as u64,
+                        total: total.unwrap_or(0),
+                    },
+                );
+            },
+            || log::info!("[updater] download complete, installing"),
+        )
+        .await
+        .map_err(|e| {
+            sentry::capture_message(
+                &format!("Update install failed: {}", e),
+                sentry::Level::Error,
+            );
+            e.to_string()
+        })?;
+
+    log::info!("[updater] update installed — restarting");
+    app.restart()
 }
 
 fn close_idle_and_enable_main(app: &tauri::AppHandle) {

@@ -15,9 +15,9 @@ mod timer;
 mod tracker;
 
 use app::commands::{
-    cmd_force_quit, cmd_get_current_user, cmd_get_projects, cmd_get_today_secs, cmd_login,
-    cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, cmd_update_tray_status,
-    CloseRequestedPayload, TrayState,
+    cmd_download_and_install, cmd_force_quit, cmd_get_current_user, cmd_get_projects,
+    cmd_get_today_secs, cmd_login, cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit,
+    cmd_update_tray_status, CloseRequestedPayload, TrayState,
 };
 use app_tracker::actor::app_tracker_actor;
 use db::init_db;
@@ -52,10 +52,14 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // Проверяем обновления при старте — в фоне
+            // Проверяем обновления при старте и затем каждые 4 часа
             let update_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                check_for_updates(update_handle).await;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(4 * 3600));
+                loop {
+                    tick.tick().await; // первый тик — немедленно
+                    check_for_updates(update_handle.clone()).await;
+                }
             });
 
             let pool =
@@ -230,6 +234,7 @@ pub fn run() {
             cmd_force_quit,
             cmd_stop_and_quit,
             cmd_update_tray_status,
+            cmd_download_and_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -279,36 +284,20 @@ async fn check_close_requested(app: tauri::AppHandle) {
     }
 }
 
+/// Проверяет наличие обновления и уведомляет фронт.
+/// Не скачивает автоматически — пользователь сам инициирует через cmd_download_and_install.
 async fn check_for_updates(app: tauri::AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
 
     match app.updater() {
-        Ok(updater) => {
-            match updater.check().await {
-                Ok(Some(update)) => {
-                    log::info!("[updater] new version available: {}", update.version);
-                    // Уведомляем фронт
-                    let _ = app.emit("update-available", update.version.clone());
-
-                    // Скачиваем и устанавливаем
-                    match update.download_and_install(|_, _| {}, || {}).await {
-                        Ok(_) => {
-                            log::info!("[updater] update installed — restarting");
-                            app.restart();
-                        }
-                        Err(e) => {
-                            sentry::capture_message(
-                                &format!("Update install failed: {}", e),
-                                sentry::Level::Error,
-                            );
-                            log::error!("[updater] install error: {}", e);
-                        }
-                    }
-                }
-                Ok(None) => log::info!("[updater] app is up to date"),
-                Err(e) => log::warn!("[updater] check error: {}", e),
+        Ok(updater) => match updater.check().await {
+            Ok(Some(update)) => {
+                log::info!("[updater] new version available: {}", update.version);
+                let _ = app.emit("update-available", update.version.clone());
             }
-        }
+            Ok(None) => log::info!("[updater] app is up to date"),
+            Err(e) => log::warn!("[updater] check error: {}", e),
+        },
         Err(e) => log::warn!("[updater] init error: {}", e),
     }
 }

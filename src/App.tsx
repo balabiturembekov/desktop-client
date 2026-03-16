@@ -10,10 +10,18 @@ interface ClosePayload {
   timer_running: boolean;
 }
 
+interface UpdateProgress {
+  downloaded: number;
+  total: number;
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
   const [closeModal, setCloseModal] = useState<ClosePayload | null>(null);
   const [closing, setClosing] = useState(false);
 
@@ -28,6 +36,15 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     listen<string>("update-available", (e) => {
       setUpdateVersion(e.payload);
+      setUpdateDismissed(false);
+    }).then((fn) => (unlisten = fn));
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<UpdateProgress>("update-progress", (e) => {
+      setUpdateProgress(e.payload);
     }).then((fn) => (unlisten = fn));
     return () => unlisten?.();
   }, []);
@@ -39,6 +56,14 @@ export default function App() {
     }).then((fn) => (unlisten = fn));
     return () => unlisten?.();
   }, []);
+
+  const handleUpdate = async () => {
+    setUpdating(true);
+    setUpdateProgress(null);
+    await invoke("cmd_download_and_install").catch(console.error);
+    // app.restart() is called server-side on success; if we reach here it failed
+    setUpdating(false);
+  };
 
   const handleWaitForSync = () => setCloseModal(null);
 
@@ -60,12 +85,55 @@ export default function App() {
     );
   }
 
+  const progressPercent =
+    updateProgress && updateProgress.total > 0
+      ? Math.round((updateProgress.downloaded / updateProgress.total) * 100)
+      : null;
+
   return (
     <>
-      {/* Update banner */}
-      {updateVersion && (
-        <div className="fixed top-0 left-0 right-0 z-40 bg-[#6ee7b7] text-[#0f0f0f] text-xs font-semibold text-center py-1.5">
-          ↑ Updating to v{updateVersion}...
+      {/* Update banner — bottom, non-intrusive */}
+      {updateVersion && !updateDismissed && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 bg-[#141414] border-t border-[#242424] px-4 py-2.5 flex items-center gap-3">
+          {updating ? (
+            <>
+              <div className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-[#6ee7b7] border-t-transparent" />
+              <div className="flex-1 min-w-0">
+                <div className="h-1 rounded-full bg-[#242424] overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[#6ee7b7] transition-all duration-300"
+                    style={{ width: progressPercent != null ? `${progressPercent}%` : "100%" }}
+                  />
+                </div>
+                <p className="text-[10px] text-[#555] mt-1">
+                  {progressPercent != null
+                    ? `Downloading… ${progressPercent}%`
+                    : "Downloading…"}
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-white font-semibold truncate">
+                  New version v{updateVersion} available
+                </p>
+              </div>
+              <button
+                onClick={handleUpdate}
+                className="shrink-0 rounded-md bg-[#6ee7b7] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#a7f3d0]"
+              >
+                Update now
+              </button>
+              <button
+                onClick={() => setUpdateDismissed(true)}
+                className="shrink-0 text-[#555] hover:text-white transition text-sm leading-none"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </>
+          )}
         </div>
       )}
 
