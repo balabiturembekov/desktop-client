@@ -15,6 +15,7 @@ use crate::tracker::models::ActivityState;
 
 const IDLE_TIMEOUT_SECS: i64 = 300;
 const CHUNK_SECS: i64 = 600; // 10 минут
+const PROGRESS_SAVE_EVERY_SECS: i64 = 60; // обновлять stub каждую минуту
 
 /// Возвращает ключ текущего дня как (year, ordinal).
 /// Использование пары year+ordinal вместо одного ordinal корректно
@@ -99,6 +100,39 @@ async fn save_chunk(
     }
 }
 
+/// Обновляет существующий stub-слот актуальными значениями (UPDATE, не INSERT).
+/// Используется для прогресс-сейвов и финализации вместо save_chunk,
+/// чтобы исключить двойной подсчёт в get_today_secs.
+async fn update_slot(
+    pool: &SqlitePool,
+    slot_id: i64,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    activity: &ActivityState,
+) {
+    let duration_secs = (ended_at - started_at).num_seconds().max(0);
+    let active = activity.active_seconds.load(Ordering::Relaxed);
+    let total = activity.total_seconds.load(Ordering::Relaxed);
+    let percent = if total > 0 { ((active * 100) / total) as i64 } else { 0 };
+
+    match sqlx::query(
+        "UPDATE time_slots SET ended_at = ?, duration_secs = ?, activity_percent = ? WHERE id = ?",
+    )
+    .bind(ended_at.to_rfc3339())
+    .bind(duration_secs)
+    .bind(percent)
+    .bind(slot_id)
+    .execute(pool)
+    .await
+    {
+        Ok(_) => log::info!(
+            "[timer] slot {} updated: {}s, {}% activity",
+            slot_id, duration_secs, percent
+        ),
+        Err(e) => log::warn!("[timer] slot update failed: {}", e),
+    }
+}
+
 fn open_idle_window(app: &AppHandle, idle_secs: u64) {
     let idle_mins = idle_secs / 60;
     let url = format!("/idle?idle_mins={}", idle_mins);
@@ -138,6 +172,8 @@ pub async fn time_actor(
     let mut current_project_id: Option<String> = None;
     let mut last_activity_at: Option<DateTime<Utc>> = None;
     let mut chunk_elapsed_secs: i64 = 0; // сколько секунд прошло в текущем чанке
+    let mut stub_slot_id: Option<i64> = None; // ID текущего stub-слота (обновляется in-place)
+    let mut last_progress_save: i64 = 0; // chunk_elapsed_secs на момент последнего прогресс-сейва
     let mut idle_window_opened = false;
     let mut tick = interval(Duration::from_secs(1));
 
@@ -161,22 +197,17 @@ pub async fn time_actor(
                             chunk_started_at = Some(start_time);
                             last_activity_at = Some(start_time);
                             chunk_elapsed_secs = 0;
+                            last_progress_save = 0;
                             activity.active_seconds.store(0, Ordering::Relaxed);
                             activity.total_seconds.store(0, Ordering::Relaxed);
 
-                            // Save a stub slot immediately so app_tracker has a valid
-                            // slot_id from the first second of tracking (not after 10 min).
-                            if let Some(slot_id) = save_chunk(
-                                &pool,
-                                &project_id,
-                                start_time,
-                                start_time,
-                                &activity,
-                            )
-                            .await
-                            {
-                                *current_slot_id.lock().await = Some(slot_id);
-                                log::info!("[timer] initial stub slot created: slot_id={}", slot_id);
+                            // Создаём stub-слот сразу: app_tracker получает slot_id с первой секунды.
+                            // Stub обновляется in-place каждые 60с и финализируется на Stop —
+                            // никогда не дублируется новым INSERT.
+                            if let Some(sid) = save_chunk(&pool, &project_id, start_time, start_time, &activity).await {
+                                stub_slot_id = Some(sid);
+                                *current_slot_id.lock().await = Some(sid);
+                                log::info!("[timer] stub slot created: slot_id={}", sid);
                             }
 
                             current_project_id = Some(project_id);
@@ -192,18 +223,17 @@ pub async fn time_actor(
                             running = false;
                             is_running_flag.store(false, Ordering::Relaxed);
 
-                            // Сохраняем последний чанк
-                            if let (Some(started_at), Some(project_id)) = (chunk_started_at.take(), current_project_id.take()) {
-                                if let Some(slot_id) = save_chunk(&pool, &project_id, started_at, Utc::now(), &activity).await {
-                                    *current_slot_id.lock().await = Some(slot_id);
-                                }
+                            // Финализируем stub in-place (UPDATE, не INSERT) —
+                            // иначе get_today_secs посчитает stub + реальный чанк дважды.
+                            if let (Some(started_at), Some(sid)) = (chunk_started_at.take(), stub_slot_id.take()) {
+                                update_slot(&pool, sid, started_at, Utc::now(), &activity).await;
                             }
-
-                            // Timer stopped — no active slot any more
+                            current_project_id = None;
                             *current_slot_id.lock().await = None;
 
                             last_activity_at = None;
                             chunk_elapsed_secs = 0;
+                            last_progress_save = 0;
                             activity.active_seconds.store(0, Ordering::Relaxed);
                             activity.total_seconds.store(0, Ordering::Relaxed);
 
@@ -218,10 +248,21 @@ pub async fn time_actor(
                     Some(TimerCommand::Reset) => {
                         running = false;
                         is_running_flag.store(false, Ordering::Relaxed);
+
+                        // Удаляем stub — прогресс сбрасывается
+                        if let Some(sid) = stub_slot_id.take() {
+                            let _ = sqlx::query("DELETE FROM time_slots WHERE id = ? AND synced = 0")
+                                .bind(sid)
+                                .execute(&pool)
+                                .await;
+                            log::info!("[timer] stub slot {} deleted on reset", sid);
+                        }
+
                         chunk_started_at = None;
                         current_project_id = None;
                         last_activity_at = None;
                         chunk_elapsed_secs = 0;
+                        last_progress_save = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
                         *current_slot_id.lock().await = None;
@@ -249,25 +290,26 @@ pub async fn time_actor(
                     // Полночь начала нового дня в UTC — граница разделения chunk
                     let midnight = midnight_utc_of(&now_local);
 
-                    if let (Some(started_at), Some(ref project_id)) =
-                        (chunk_started_at.take(), &current_project_id)
-                    {
-                        // Часть 1: от chunk_started_at до полуночи → записывается в старый день
+                    // Финализируем stub старого дня — UPDATE до полуночи (не INSERT)
+                    if let (Some(started_at), Some(sid)) = (chunk_started_at.take(), stub_slot_id.take()) {
                         let secs_yesterday = (midnight - started_at).num_seconds().max(0);
                         if secs_yesterday > 0 {
-                            if let Some(slot_id) =
-                                save_chunk(&pool, project_id, started_at, midnight, &activity)
-                                    .await
-                            {
-                                *current_slot_id.lock().await = Some(slot_id);
-                            }
+                            update_slot(&pool, sid, started_at, midnight, &activity).await;
                         }
                     }
 
-                    // Часть 2: новый chunk начинается ровно с полуночи нового дня
+                    // Новый stub для нового дня, начиная с полуночи
+                    if let Some(ref project_id) = current_project_id {
+                        if let Some(sid) = save_chunk(&pool, project_id, midnight, midnight, &activity).await {
+                            stub_slot_id = Some(sid);
+                            *current_slot_id.lock().await = Some(sid);
+                        }
+                    }
+
                     chunk_started_at = Some(midnight);
                     today_secs_cache = 0;
                     chunk_elapsed_secs = 0;
+                    last_progress_save = 0;
                     activity.active_seconds.store(0, Ordering::Relaxed);
                     activity.total_seconds.store(0, Ordering::Relaxed);
 
@@ -293,19 +335,19 @@ pub async fn time_actor(
                         idle_window_opened = true;
                         is_running_flag.store(false, Ordering::Relaxed);
 
-                        if let (Some(started_at), Some(ref project_id)) = (chunk_started_at.take(), &current_project_id) {
+                        // Финализируем stub до момента последней активности (UPDATE, не INSERT)
+                        if let (Some(started_at), Some(sid)) = (chunk_started_at.take(), stub_slot_id.take()) {
                             let active_until = last_active;
                             let duration = (active_until - started_at).num_seconds().max(0);
                             if duration > 0 {
-                                if let Some(slot_id) = save_chunk(&pool, project_id, started_at, active_until, &activity).await {
-                                    *current_slot_id.lock().await = Some(slot_id);
-                                }
+                                update_slot(&pool, sid, started_at, active_until, &activity).await;
                             }
                         }
 
                         current_project_id = None;
                         last_activity_at = None;
                         chunk_elapsed_secs = 0;
+                        last_progress_save = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
                         *current_slot_id.lock().await = None;
@@ -322,24 +364,39 @@ pub async fn time_actor(
                     }
                 }
 
-                // 10-минутный чанк
+                // Прогресс-сейв каждые 60 секунд: UPDATE stub in-place
                 chunk_elapsed_secs += 1;
+                if chunk_elapsed_secs - last_progress_save >= PROGRESS_SAVE_EVERY_SECS {
+                    last_progress_save = chunk_elapsed_secs;
+                    if let (Some(sid), Some(started_at)) = (stub_slot_id, chunk_started_at) {
+                        update_slot(&pool, sid, started_at, Utc::now(), &activity).await;
+                    }
+                }
+
+                // 10-минутный чанк: финализируем текущий stub, создаём новый
                 if chunk_elapsed_secs >= CHUNK_SECS {
-                    log::info!("[timer] chunk complete — saving");
+                    log::info!("[timer] chunk complete");
 
                     if let (Some(started_at), Some(ref project_id)) = (chunk_started_at.take(), &current_project_id) {
                         let ended_at = Utc::now();
-                        if let Some(slot_id) = save_chunk(&pool, project_id, started_at, ended_at, &activity).await {
-                            *current_slot_id.lock().await = Some(slot_id);
+
+                        // Финализируем текущий stub (UPDATE до конца чанка)
+                        if let Some(sid) = stub_slot_id.take() {
+                            update_slot(&pool, sid, started_at, ended_at, &activity).await;
                         }
 
-                        // Начинаем новый чанк
+                        // Создаём новый stub для следующего чанка
+                        if let Some(new_sid) = save_chunk(&pool, project_id, ended_at, ended_at, &activity).await {
+                            stub_slot_id = Some(new_sid);
+                            *current_slot_id.lock().await = Some(new_sid);
+                        }
+
                         chunk_started_at = Some(ended_at);
                         chunk_elapsed_secs = 0;
+                        last_progress_save = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
 
-                        // Обновляем кеш
                         today_secs_cache = get_today_secs(&pool).await;
                     }
                 }
