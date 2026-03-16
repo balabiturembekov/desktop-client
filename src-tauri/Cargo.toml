@@ -34,3 +34,4 @@ sentry = { version = "0.34", default-features = false, features = ["backtrace", 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-updater = "2.10.0"
 tauri-plugin-log = "2"
+active-win-pos-rs = "0.9"

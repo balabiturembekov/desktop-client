@@ -5,6 +5,7 @@ use tauri::Manager;
 use tokio::sync::{mpsc, Mutex};
 mod api;
 mod app;
+mod app_tracker;
 mod db;
 mod screenshot;
 mod sync;
@@ -24,6 +25,7 @@ use timer::{
     models::TimerState,
 };
 use tracker::{actor::activity_actor, listener::start_listener, models::ActivityState};
+use app_tracker::actor::app_tracker_actor;
 
 pub fn run() {
     let _sentry = sentry::init((
@@ -97,6 +99,12 @@ pub fn run() {
             tauri::async_runtime::spawn(screenshot_actor(
                 pool.clone(),
                 screenshots_dir,
+                is_running.clone(),
+                current_slot_id.clone(),
+            ));
+
+            tauri::async_runtime::spawn(app_tracker_actor(
+                pool.clone(),
                 is_running.clone(),
                 current_slot_id,
             ));

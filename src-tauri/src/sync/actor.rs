@@ -4,7 +4,8 @@ use std::time::Duration;
 use tokio::time::interval;
 
 use crate::api::auth::refresh_token;
-use crate::api::sync::{create_time_entry, upload_screenshot, TimeEntryRequest};
+use crate::api::sync::{create_time_entry, upload_app_usage, upload_screenshot, TimeEntryRequest};
+use crate::app_tracker::models::AppUsagePayload;
 use crate::db::models::user::User;
 
 pub async fn sync_actor(pool: SqlitePool) {
@@ -161,6 +162,48 @@ async fn sync_pending(pool: &SqlitePool, client: &Client) {
                         sentry::Level::Warning,
                     );
                     log::warn!("[sync] screenshot failed: {}", e);
+                }
+            }
+        }
+
+        // Sync app usage for this slot
+        let app_usages = sqlx::query_as::<_, (i64, String, String, Option<String>, i64)>(
+            "SELECT id, app_name, window_title, url, duration_secs FROM app_usage WHERE time_slot_id = ? AND synced = 0",
+        )
+        .bind(slot_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        if !app_usages.is_empty() {
+            let payloads: Vec<AppUsagePayload> = app_usages
+                .iter()
+                .map(|(_, app, title, url, dur)| AppUsagePayload {
+                    app_name: app.clone(),
+                    window_title: title.clone(),
+                    url: url.clone(),
+                    duration_secs: *dur,
+                })
+                .collect();
+
+            match upload_app_usage(client, &token, &remote_id, &payloads).await {
+                Ok(_) => {
+                    log::info!("[sync] app usage uploaded for slot {}", slot_id);
+                    for (usage_id, ..) in &app_usages {
+                        let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE id = ?")
+                            .bind(usage_id)
+                            .execute(pool)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    if !e.contains("404") {
+                        sentry::capture_message(
+                            &format!("App usage upload failed for slot {}: {}", slot_id, e),
+                            sentry::Level::Warning,
+                        );
+                    }
+                    log::warn!("[sync] app usage upload failed: {}", e);
                 }
             }
         }

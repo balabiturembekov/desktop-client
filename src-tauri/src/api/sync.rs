@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::app_tracker::models::AppUsagePayload;
+
 const BASE_URL: &str = "https://api.hubnity.io/api/v1";
 
 #[derive(Debug, Serialize)]
@@ -80,6 +82,27 @@ pub async fn upload_screenshot(
 
     if !res.status().is_success() {
         return Err(format!("Failed to upload screenshot: {}", res.status()));
+    }
+
+    Ok(())
+}
+
+pub async fn upload_app_usage(
+    client: &Client,
+    token: &str,
+    time_entry_id: &str,
+    usages: &[AppUsagePayload],
+) -> Result<(), String> {
+    let res = client
+        .post(format!("{}/time-entries/{}/app-usage", BASE_URL, time_entry_id))
+        .bearer_auth(token)
+        .json(usages)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!("Failed to upload app usage: {}", res.status()));
     }
 
     Ok(())
