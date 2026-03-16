@@ -50,7 +50,10 @@ jobs:
             libxtst-dev \
             libx11-dev \
             libxcb1-dev \
-            libxrandr-dev
+            libxrandr-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            pipewire
 
       - name: Install frontend dependencies
         run: pnpm install
