@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use chrono::{DateTime, Datelike, Local, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
@@ -15,6 +15,27 @@ use crate::tracker::models::ActivityState;
 
 const IDLE_TIMEOUT_SECS: i64 = 300;
 const CHUNK_SECS: i64 = 600; // 10 минут
+
+/// Возвращает ключ текущего дня как (year, ordinal).
+/// Использование пары year+ordinal вместо одного ordinal корректно
+/// обрабатывает смену года: Dec 31 (2024, 366) ≠ Jan 1 (2025, 1).
+fn day_key(dt: &DateTime<Local>) -> (i32, u32) {
+    (dt.year(), dt.ordinal())
+}
+
+/// UTC-момент начала (полночь 00:00:00) того локального дня, которому принадлежит `dt`.
+/// Используется для точного разделения chunk при day rollover.
+/// При DST-переходе, который убирает полночь, возвращает `dt.to_utc()` как fallback.
+fn midnight_utc_of(dt: &DateTime<Local>) -> DateTime<Utc> {
+    let naive_midnight = dt
+        .date_naive()
+        .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+    Local
+        .from_local_datetime(&naive_midnight)
+        .single()
+        .map(|ldt| ldt.to_utc())
+        .unwrap_or_else(|| dt.to_utc())
+}
 
 #[derive(Serialize, Clone)]
 pub struct TimerPayload {
@@ -121,7 +142,7 @@ pub async fn time_actor(
     let mut tick = interval(Duration::from_secs(1));
 
     let mut today_secs_cache = get_today_secs(&pool).await;
-    let mut current_day = Local::now().ordinal();
+    let mut current_day = day_key(&Local::now());
 
     log::info!("[timer] initialized with {} secs from today", today_secs_cache);
 
@@ -132,7 +153,7 @@ pub async fn time_actor(
                     Some(TimerCommand::Start { project_id }) => {
                         if !running {
                             today_secs_cache = get_today_secs(&pool).await;
-                            current_day = Local::now().ordinal();
+                            current_day = day_key(&Local::now());
                             running = true;
                             idle_window_opened = false;
                             is_running_flag.store(true, Ordering::Relaxed);
@@ -167,7 +188,7 @@ pub async fn time_actor(
                             activity.total_seconds.store(0, Ordering::Relaxed);
 
                             today_secs_cache = get_today_secs(&pool).await;
-                            current_day = Local::now().ordinal();
+                            current_day = day_key(&Local::now());
                             let _ = app.emit("timer-tick", TimerPayload {
                                 total_secs: today_secs_cache as u64,
                                 is_running: false,
@@ -184,7 +205,7 @@ pub async fn time_actor(
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
                         today_secs_cache = get_today_secs(&pool).await;
-                        current_day = Local::now().ordinal();
+                        current_day = day_key(&Local::now());
                         let _ = app.emit("timer-tick", TimerPayload {
                             total_secs: today_secs_cache as u64,
                             is_running: false,
@@ -195,19 +216,36 @@ pub async fn time_actor(
             }
             _ = tick.tick(), if running => {
                 // Day rollover
-                let now_day = Local::now().ordinal();
+                let now_local = Local::now();
+                let now_day = day_key(&now_local);
                 if now_day != current_day {
-                    log::info!("[timer] day rollover!");
+                    log::info!(
+                        "[timer] day rollover: ({}, {}) → ({}, {})",
+                        current_day.0, current_day.1, now_day.0, now_day.1
+                    );
                     current_day = now_day;
 
-                    if let (Some(started_at), Some(ref project_id)) = (chunk_started_at.take(), &current_project_id) {
-                        if let Some(slot_id) = save_chunk(&pool, project_id, started_at, Utc::now(), &activity).await {
-                            *current_slot_id.lock().await = Some(slot_id);
+                    // Полночь начала нового дня в UTC — граница разделения chunk
+                    let midnight = midnight_utc_of(&now_local);
+
+                    if let (Some(started_at), Some(ref project_id)) =
+                        (chunk_started_at.take(), &current_project_id)
+                    {
+                        // Часть 1: от chunk_started_at до полуночи → записывается в старый день
+                        let secs_yesterday = (midnight - started_at).num_seconds().max(0);
+                        if secs_yesterday > 0 {
+                            if let Some(slot_id) =
+                                save_chunk(&pool, project_id, started_at, midnight, &activity)
+                                    .await
+                            {
+                                *current_slot_id.lock().await = Some(slot_id);
+                            }
                         }
                     }
 
+                    // Часть 2: новый chunk начинается ровно с полуночи нового дня
+                    chunk_started_at = Some(midnight);
                     today_secs_cache = 0;
-                    chunk_started_at = Some(Utc::now());
                     chunk_elapsed_secs = 0;
                     activity.active_seconds.store(0, Ordering::Relaxed);
                     activity.total_seconds.store(0, Ordering::Relaxed);
@@ -295,5 +333,141 @@ pub async fn time_actor(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{day_key, midnight_utc_of};
+    use chrono::{Datelike, Local, TimeZone, Timelike};
+
+    // ── day_key ──────────────────────────────────────────────────────────────
+
+    /// Dec 31 → Jan 1: ordinal прыгает 366 → 1, но пара (year, ordinal) различается.
+    #[test]
+    fn test_day_key_new_year_rollover() {
+        // 2024 — високосный, поэтому Dec 31 = ordinal 366
+        let dec31 = Local.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap();
+        let jan01 = Local.with_ymd_and_hms(2025, 1, 1, 0, 0, 1).unwrap();
+
+        assert_ne!(day_key(&dec31), day_key(&jan01), "year boundary must be detected");
+        assert_eq!(day_key(&dec31), (2024, 366));
+        assert_eq!(day_key(&jan01), (2025, 1));
+    }
+
+    /// Два момента одного и того же дня должны давать одинаковый ключ.
+    #[test]
+    fn test_day_key_same_day() {
+        let morning = Local.with_ymd_and_hms(2025, 6, 15, 0, 0, 0).unwrap();
+        let night = Local.with_ymd_and_hms(2025, 6, 15, 23, 59, 59).unwrap();
+        assert_eq!(day_key(&morning), day_key(&night));
+    }
+
+    /// 23:59:59 и 00:00:00 следующего дня должны давать разные ключи.
+    #[test]
+    fn test_day_key_midnight_boundary() {
+        let before = Local.with_ymd_and_hms(2025, 6, 15, 23, 59, 59).unwrap();
+        let after = Local.with_ymd_and_hms(2025, 6, 16, 0, 0, 0).unwrap();
+        assert_ne!(day_key(&before), day_key(&after));
+    }
+
+    /// Один и тот же ordinal в разных годах — не должны быть равны.
+    #[test]
+    fn test_day_key_same_ordinal_different_year() {
+        let y2024 = Local.with_ymd_and_hms(2024, 4, 9, 12, 0, 0).unwrap(); // ordinal 100
+        let y2025 = Local.with_ymd_and_hms(2025, 4, 10, 12, 0, 0).unwrap(); // ordinal 100
+        // Оба ordinal == 100, но годы разные → ключи должны быть разные
+        assert_eq!(y2024.ordinal(), y2025.ordinal(), "setup: both should be day 100");
+        assert_ne!(day_key(&y2024), day_key(&y2025), "different years must not be equal");
+    }
+
+    // ── midnight_utc_of ───────────────────────────────────────────────────────
+
+    /// Конвертация обратно в локальное время должна давать 00:00:00 того же дня.
+    #[test]
+    fn test_midnight_utc_is_local_midnight() {
+        let dt = Local.with_ymd_and_hms(2025, 6, 15, 22, 30, 45).unwrap();
+        let midnight = midnight_utc_of(&dt);
+        let midnight_local = midnight.with_timezone(&Local);
+
+        assert_eq!(midnight_local.hour(), 0);
+        assert_eq!(midnight_local.minute(), 0);
+        assert_eq!(midnight_local.second(), 0);
+        assert_eq!(midnight_local.date_naive(), dt.date_naive());
+    }
+
+    /// Полночь, вычисленная из разных моментов одного дня, должна быть одинаковой.
+    #[test]
+    fn test_midnight_utc_same_for_same_day() {
+        let t1 = Local.with_ymd_and_hms(2025, 3, 17, 8, 0, 0).unwrap();
+        let t2 = Local.with_ymd_and_hms(2025, 3, 17, 23, 59, 59).unwrap();
+        assert_eq!(midnight_utc_of(&t1), midnight_utc_of(&t2));
+    }
+
+    // ── chunk split logic ─────────────────────────────────────────────────────
+
+    /// Chunk начался в 23:55:00, rollover-тик пришёл в 00:00:01.
+    /// Часть до полуночи = 5 мин = 300 сек. Новый chunk начинается с полуночи.
+    #[test]
+    fn test_chunk_split_at_midnight() {
+        let chunk_start = Local
+            .with_ymd_and_hms(2025, 6, 15, 23, 55, 0)
+            .unwrap()
+            .to_utc();
+
+        // Тик после полуночи
+        let tick_local = Local.with_ymd_and_hms(2025, 6, 16, 0, 0, 1).unwrap();
+        let midnight = midnight_utc_of(&tick_local);
+
+        let secs_yesterday = (midnight - chunk_start).num_seconds().max(0);
+        assert_eq!(secs_yesterday, 300, "5 minutes before midnight = 300 secs");
+
+        // Новый chunk стартует ровно с полуночи
+        let new_start_local = midnight.with_timezone(&Local);
+        assert_eq!(new_start_local.hour(), 0);
+        assert_eq!(new_start_local.minute(), 0);
+        assert_eq!(new_start_local.second(), 0);
+        assert_eq!(new_start_local.date_naive(), tick_local.date_naive());
+    }
+
+    /// Если chunk начался до полуночи, но rollover был обнаружен через 3 тика
+    /// (до 00:00:03), вчерашняя часть всё равно должна рассчитываться корректно.
+    #[test]
+    fn test_chunk_split_late_detection() {
+        let chunk_start = Local
+            .with_ymd_and_hms(2025, 12, 31, 23, 50, 0)
+            .unwrap()
+            .to_utc();
+
+        let tick_local = Local.with_ymd_and_hms(2026, 1, 1, 0, 0, 3).unwrap();
+        let midnight = midnight_utc_of(&tick_local);
+
+        let secs_yesterday = (midnight - chunk_start).num_seconds().max(0);
+        // 23:50:00 → 00:00:00 = 10 мин = 600 сек
+        assert_eq!(secs_yesterday, 600);
+
+        // Проверяем, что midnight принадлежит новому году
+        let midnight_local = midnight.with_timezone(&Local);
+        assert_eq!(midnight_local.year(), 2026);
+        assert_eq!(midnight_local.month(), 1);
+        assert_eq!(midnight_local.day(), 1);
+    }
+
+    /// Chunk начался уже после полуночи — secs_yesterday должно быть 0
+    /// (не сохранять пустой слот для вчерашнего дня).
+    #[test]
+    fn test_chunk_no_yesterday_if_started_after_midnight() {
+        // Гипотетический случай: rollover определён поздно, но chunk начался
+        // уже после полуночи (например, таймер запустили в 00:05)
+        let chunk_start = Local
+            .with_ymd_and_hms(2025, 6, 16, 0, 5, 0)
+            .unwrap()
+            .to_utc();
+
+        let tick_local = Local.with_ymd_and_hms(2025, 6, 16, 0, 5, 1).unwrap();
+        let midnight = midnight_utc_of(&tick_local);
+
+        let secs_yesterday = (midnight - chunk_start).num_seconds().max(0);
+        assert_eq!(secs_yesterday, 0, "chunk started after midnight — no yesterday portion");
     }
 }
