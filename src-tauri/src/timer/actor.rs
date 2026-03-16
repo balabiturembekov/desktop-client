@@ -157,12 +157,29 @@ pub async fn time_actor(
                             running = true;
                             idle_window_opened = false;
                             is_running_flag.store(true, Ordering::Relaxed);
-                            chunk_started_at = Some(Utc::now());
-                            last_activity_at = Some(Utc::now());
+                            let start_time = Utc::now();
+                            chunk_started_at = Some(start_time);
+                            last_activity_at = Some(start_time);
                             chunk_elapsed_secs = 0;
-                            current_project_id = Some(project_id);
                             activity.active_seconds.store(0, Ordering::Relaxed);
                             activity.total_seconds.store(0, Ordering::Relaxed);
+
+                            // Save a stub slot immediately so app_tracker has a valid
+                            // slot_id from the first second of tracking (not after 10 min).
+                            if let Some(slot_id) = save_chunk(
+                                &pool,
+                                &project_id,
+                                start_time,
+                                start_time,
+                                &activity,
+                            )
+                            .await
+                            {
+                                *current_slot_id.lock().await = Some(slot_id);
+                                log::info!("[timer] initial stub slot created: slot_id={}", slot_id);
+                            }
+
+                            current_project_id = Some(project_id);
                             tick.reset();
                             let _ = app.emit("timer-tick", TimerPayload {
                                 total_secs: today_secs_cache as u64,
@@ -181,6 +198,9 @@ pub async fn time_actor(
                                     *current_slot_id.lock().await = Some(slot_id);
                                 }
                             }
+
+                            // Timer stopped — no active slot any more
+                            *current_slot_id.lock().await = None;
 
                             last_activity_at = None;
                             chunk_elapsed_secs = 0;
@@ -204,6 +224,7 @@ pub async fn time_actor(
                         chunk_elapsed_secs = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
+                        *current_slot_id.lock().await = None;
                         today_secs_cache = get_today_secs(&pool).await;
                         current_day = day_key(&Local::now());
                         let _ = app.emit("timer-tick", TimerPayload {
@@ -287,6 +308,7 @@ pub async fn time_actor(
                         chunk_elapsed_secs = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
+                        *current_slot_id.lock().await = None;
 
                         today_secs_cache = get_today_secs(&pool).await;
                         let _ = app.emit("timer-idle", IdlePayload { idle_secs: idle_secs as u64 });
