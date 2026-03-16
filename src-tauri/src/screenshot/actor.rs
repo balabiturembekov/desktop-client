@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use crate::screenshot::capture::capture_screenshot;
 
@@ -13,6 +14,7 @@ pub async fn screenshot_actor(
     pool: SqlitePool,
     screenshots_dir: PathBuf,
     is_running: Arc<AtomicBool>,
+    current_slot_id: Arc<Mutex<Option<i64>>>,
 ) {
     loop {
         if !is_running.load(Ordering::Relaxed) {
@@ -36,18 +38,13 @@ pub async fn screenshot_actor(
 
         match capture_screenshot(&screenshots_dir) {
             Ok(path) => {
-                let taken_at = Utc::now().to_rfc3339();
-                let path_str = path.to_string_lossy().to_string();
-                let pool = pool.clone();
+                let slot_id = *current_slot_id.lock().await;
+                if let Some(slot_id) = slot_id {
+                    let taken_at = Utc::now().to_rfc3339();
+                    let path_str = path.to_string_lossy().to_string();
+                    let pool = pool.clone();
 
-                tokio::spawn(async move {
-                    let result = sqlx::query_as::<_, (i64,)>(
-                        "SELECT id FROM time_slots ORDER BY id DESC LIMIT 1",
-                    )
-                    .fetch_optional(&pool)
-                    .await;
-
-                    if let Ok(Some((slot_id,))) = result {
+                    tokio::spawn(async move {
                         let _ = sqlx::query(
                             r#"INSERT INTO screenshots (time_slot_id, file_path, taken_at, synced)
                             VALUES (?, ?, ?, 0)"#,
@@ -57,11 +54,13 @@ pub async fn screenshot_actor(
                         .bind(&taken_at)
                         .execute(&pool)
                         .await;
-                        println!("[screenshot] saved: {}", path_str);
-                    }
-                });
+                        log::info!("[screenshot] saved: {} (slot {})", path_str, slot_id);
+                    });
+                } else {
+                    log::warn!("[screenshot] captured but no active slot_id, skipping save");
+                }
             }
-            Err(e) => eprintln!("[screenshot] capture error: {}", e),
+            Err(e) => log::error!("[screenshot] capture error: {}", e),
         }
 
         let remaining = INTERVAL_SECS.saturating_sub(random_delay.max(5));

@@ -2,11 +2,19 @@ use crate::api::models::auth::{
     LoginRequest, LoginResponse, RefreshRequest, RefreshResponse, RemoteProject,
 };
 use reqwest::Client;
+use std::time::Duration;
 
 const BASE_URL: &str = "https://api.hubnity.io/api/v1";
 
+fn build_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
+
 pub async fn login(email: &str, password: &str) -> Result<LoginResponse, String> {
-    let client = Client::new();
+    let client = build_client();
     let res = client
         .post(format!("{}/auth/login", BASE_URL))
         .json(&LoginRequest {
@@ -25,7 +33,7 @@ pub async fn login(email: &str, password: &str) -> Result<LoginResponse, String>
 }
 
 pub async fn refresh_token(refresh_token: &str) -> Result<RefreshResponse, String> {
-    let client = Client::new();
+    let client = build_client();
     let res = client
         .post(format!("{}/auth/refresh", BASE_URL))
         .json(&RefreshRequest {
@@ -45,7 +53,7 @@ pub async fn refresh_token(refresh_token: &str) -> Result<RefreshResponse, Strin
 }
 
 pub async fn fetch_projects(token: &str) -> Result<Vec<RemoteProject>, String> {
-    let client = Client::new();
+    let client = build_client();
     let res = client
         .get(format!("{}/projects", BASE_URL))
         .bearer_auth(token)

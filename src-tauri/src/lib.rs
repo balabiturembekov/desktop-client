@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 mod api;
 mod app;
 mod db;
@@ -41,6 +41,7 @@ pub fn run() {
 
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -64,6 +65,7 @@ pub fn run() {
 
             let is_running = Arc::new(AtomicBool::new(false));
             let activity_state = ActivityState::new();
+            let current_slot_id: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
 
             let (tx, rx) = mpsc::channel(8);
             tauri::async_runtime::spawn(time_actor(
@@ -72,6 +74,7 @@ pub fn run() {
                 pool.clone(),
                 is_running.clone(),
                 activity_state.clone(),
+                current_slot_id.clone(),
             ));
             app.manage(TimerState {
                 sender: tx,
@@ -95,6 +98,7 @@ pub fn run() {
                 pool.clone(),
                 screenshots_dir,
                 is_running.clone(),
+                current_slot_id,
             ));
 
             tauri::async_runtime::spawn(sync_actor(pool.clone()));
@@ -125,14 +129,14 @@ async fn check_for_updates(app: tauri::AppHandle) {
         Ok(updater) => {
             match updater.check().await {
                 Ok(Some(update)) => {
-                    println!("[updater] new version available: {}", update.version);
+                    log::info!("[updater] new version available: {}", update.version);
                     // Уведомляем фронт
                     let _ = app.emit("update-available", update.version.clone());
 
                     // Скачиваем и устанавливаем
                     match update.download_and_install(|_, _| {}, || {}).await {
                         Ok(_) => {
-                            println!("[updater] update installed — restarting");
+                            log::info!("[updater] update installed — restarting");
                             app.restart();
                         }
                         Err(e) => {
@@ -140,14 +144,14 @@ async fn check_for_updates(app: tauri::AppHandle) {
                                 &format!("Update install failed: {}", e),
                                 sentry::Level::Error,
                             );
-                            eprintln!("[updater] install error: {}", e);
+                            log::error!("[updater] install error: {}", e);
                         }
                     }
                 }
-                Ok(None) => println!("[updater] app is up to date"),
-                Err(e) => eprintln!("[updater] check error: {}", e),
+                Ok(None) => log::info!("[updater] app is up to date"),
+                Err(e) => log::warn!("[updater] check error: {}", e),
             }
         }
-        Err(e) => eprintln!("[updater] init error: {}", e),
+        Err(e) => log::warn!("[updater] init error: {}", e),
     }
 }

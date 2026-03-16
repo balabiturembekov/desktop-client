@@ -1,18 +1,25 @@
+use reqwest::Client;
 use sqlx::SqlitePool;
-use tokio::time::{interval, Duration};
+use std::time::Duration;
+use tokio::time::interval;
 
 use crate::api::auth::refresh_token;
 use crate::api::sync::{create_time_entry, upload_screenshot, TimeEntryRequest};
 use crate::db::models::user::User;
 
 pub async fn sync_actor(pool: SqlitePool) {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build http client");
+
     let mut sync_tick = interval(Duration::from_secs(30));
     let mut cleanup_tick = interval(Duration::from_secs(3600));
 
     loop {
         tokio::select! {
             _ = sync_tick.tick() => {
-                sync_pending(&pool).await;
+                sync_pending(&pool, &client).await;
             }
             _ = cleanup_tick.tick() => {
                 cleanup_old_data(&pool).await;
@@ -21,8 +28,8 @@ pub async fn sync_actor(pool: SqlitePool) {
     }
 }
 
-async fn is_online() -> bool {
-    reqwest::Client::new()
+async fn is_online(client: &Client) -> bool {
+    client
         .get("https://api.hubnity.io/api/v1")
         .timeout(Duration::from_secs(5))
         .send()
@@ -42,7 +49,7 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
             .bind(&user.remote_id)
             .execute(pool)
             .await;
-            println!("[sync] token refreshed");
+            log::info!("[sync] token refreshed");
             Some(res.access_token)
         }
         Err(e) => {
@@ -50,14 +57,14 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
                 &format!("Token refresh failed: {}", e),
                 sentry::Level::Error,
             );
-            eprintln!("[sync] token refresh failed: {}", e);
+            log::error!("[sync] token refresh failed: {}", e);
             None
         }
     }
 }
 
-async fn sync_pending(pool: &SqlitePool) {
-    if !is_online().await {
+async fn sync_pending(pool: &SqlitePool, client: &Client) {
+    if !is_online(client).await {
         return;
     }
 
@@ -88,7 +95,7 @@ async fn sync_pending(pool: &SqlitePool) {
         return;
     }
 
-    println!("[sync] syncing {} slots", slots.len());
+    log::info!("[sync] syncing {} slots", slots.len());
     let mut token = user.access_token.clone();
 
     for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in slots {
@@ -100,12 +107,12 @@ async fn sync_pending(pool: &SqlitePool) {
             activity_percent,
         };
 
-        let remote_id = match create_time_entry(&token, &entry).await {
+        let remote_id = match create_time_entry(client, &token, &entry).await {
             Ok(res) => res.id,
             Err(e) if e.contains("401") => match try_refresh(pool).await {
                 Some(new_token) => {
                     token = new_token;
-                    match create_time_entry(&token, &entry).await {
+                    match create_time_entry(client, &token, &entry).await {
                         Ok(res) => res.id,
                         Err(e) => {
                             sentry::capture_message(
@@ -126,7 +133,7 @@ async fn sync_pending(pool: &SqlitePool) {
                         sentry::Level::Error,
                     );
                 }
-                eprintln!("[sync] failed slot {}: {}", slot_id, e);
+                log::error!("[sync] failed slot {}: {}", slot_id, e);
                 continue;
             }
         };
@@ -140,9 +147,9 @@ async fn sync_pending(pool: &SqlitePool) {
         .unwrap_or_default();
 
         for (screenshot_id, file_path) in screenshots {
-            match upload_screenshot(&token, &remote_id, &file_path, activity_percent).await {
+            match upload_screenshot(client, &token, &remote_id, &file_path, activity_percent).await {
                 Ok(_) => {
-                    println!("[sync] screenshot uploaded: {}", file_path);
+                    log::info!("[sync] screenshot uploaded: {}", file_path);
                     let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
                         .bind(screenshot_id)
                         .execute(pool)
@@ -153,7 +160,7 @@ async fn sync_pending(pool: &SqlitePool) {
                         &format!("Screenshot upload failed {}: {}", file_path, e),
                         sentry::Level::Warning,
                     );
-                    eprintln!("[sync] screenshot failed: {}", e);
+                    log::warn!("[sync] screenshot failed: {}", e);
                 }
             }
         }
@@ -163,7 +170,7 @@ async fn sync_pending(pool: &SqlitePool) {
             .execute(pool)
             .await;
 
-        println!("[sync] slot {} synced ✓", slot_id);
+        log::info!("[sync] slot {} synced ✓", slot_id);
     }
 }
 
@@ -183,7 +190,7 @@ async fn cleanup_old_data(pool: &SqlitePool) {
     for (id, file_path) in old_screenshots {
         match tokio::fs::remove_file(&file_path).await {
             Ok(_) => deleted_files += 1,
-            Err(e) => eprintln!("[cleanup] file error {}: {}", file_path, e),
+            Err(e) => log::warn!("[cleanup] file error {}: {}", file_path, e),
         }
         if sqlx::query("DELETE FROM screenshots WHERE id = ?")
             .bind(id)
@@ -196,7 +203,7 @@ async fn cleanup_old_data(pool: &SqlitePool) {
     }
 
     if deleted_records > 0 {
-        println!(
+        log::info!(
             "[cleanup] {} files, {} records removed",
             deleted_files, deleted_records
         );
@@ -212,7 +219,7 @@ async fn cleanup_old_data(pool: &SqlitePool) {
 
     if let Ok(r) = result {
         if r.rows_affected() > 0 {
-            println!("[cleanup] deleted {} old slots", r.rows_affected());
+            log::info!("[cleanup] deleted {} old slots", r.rows_affected());
         }
     }
 }

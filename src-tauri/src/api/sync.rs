@@ -18,11 +18,10 @@ pub struct TimeEntryResponse {
 }
 
 pub async fn create_time_entry(
+    client: &Client,
     token: &str,
     entry: &TimeEntryRequest,
 ) -> Result<TimeEntryResponse, String> {
-    let client = Client::new();
-
     let res = client
         .post(format!("{}/time-entries", BASE_URL))
         .bearer_auth(token)
@@ -41,13 +40,12 @@ pub async fn create_time_entry(
 }
 
 pub async fn upload_screenshot(
+    client: &Client,
     token: &str,
     time_entry_id: &str,
     file_path: &str,
     activity_percent: i64,
 ) -> Result<(), String> {
-    let client = Client::new();
-
     let file_bytes = tokio::fs::read(file_path)
         .await
         .map_err(|e| e.to_string())?;

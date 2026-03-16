@@ -21,6 +21,7 @@ export default function TrackerPage({ user, onLogout }: Props) {
   const [totalSecs, setTotalSecs] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  const [starting, setStarting] = useState(false);
 
   useEffect(() => {
     // Загружаем проекты и today secs параллельно
@@ -53,12 +54,24 @@ useEffect(() => {
       unlistenDayRollover?.();
     };
   }, []);
-  const handleStart = () => {
-    if (!selectedProject) return;
-    invoke("start_worker_timer", { projectId: selectedProject.remote_id }).catch(console.error);
+  const handleStart = async () => {
+    if (!selectedProject || starting) return;
+    setStarting(true);
+    try {
+      await invoke("start_worker_timer", { projectId: selectedProject.remote_id });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setStarting(false);
+    }
   };
   const handleStop = () => invoke("stop_worker_timer").catch(console.error);
-  const handleReset = () => invoke("reset_worker_timer").catch(console.error);
+  const handleReset = async () => {
+    if (isRunning) {
+      if (!window.confirm("Timer is running. Reset will discard the current session. Continue?")) return;
+    }
+    await invoke("reset_worker_timer").catch(console.error);
+  };
 
   if (!initialized) {
     return (
@@ -126,10 +139,10 @@ useEffect(() => {
           {!isRunning ? (
             <button
               onClick={handleStart}
-              disabled={!selectedProject}
+              disabled={!selectedProject || starting}
               className="flex-1 rounded-lg bg-[#6ee7b7] py-2.5 text-sm font-semibold text-[#0f0f0f] transition hover:bg-[#a7f3d0] disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              ▶ Start
+              {starting ? "..." : "▶ Start"}
             </button>
           ) : (
             <button
