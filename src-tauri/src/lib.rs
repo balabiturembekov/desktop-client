@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
+use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tokio::sync::{mpsc, Mutex};
 mod api;
 mod app;
@@ -14,18 +16,19 @@ mod tracker;
 
 use app::commands::{
     cmd_force_quit, cmd_get_current_user, cmd_get_projects, cmd_get_today_secs, cmd_login,
-    cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, CloseRequestedPayload,
+    cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, cmd_update_tray_status,
+    CloseRequestedPayload, TrayState,
 };
+use app_tracker::actor::app_tracker_actor;
 use db::init_db;
 use screenshot::actor::screenshot_actor;
 use sync::actor::sync_actor;
 use timer::{
     actor::time_actor,
     commands::{reset_worker_timer, start_worker_timer, stop_worker_timer},
-    models::TimerState,
+    models::{TimerCommand, TimerState},
 };
 use tracker::{actor::activity_actor, listener::start_listener, models::ActivityState};
-use app_tracker::actor::app_tracker_actor;
 
 pub fn run() {
     let _sentry = sentry::init((
@@ -113,6 +116,93 @@ pub fn run() {
 
             app.manage(pool);
 
+            // ── System Tray ──────────────────────────────────────────────
+            let show_item = MenuItemBuilder::with_id("show", "Show Hubnity").build(app)?;
+            let timer_item = MenuItemBuilder::with_id("timer_toggle", "Start Timer").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .item(&sep1)
+                .item(&timer_item)
+                .item(&sep2)
+                .item(&quit_item)
+                .build()?;
+
+            let icon = app
+                .default_window_icon()
+                .expect("no default icon")
+                .clone();
+
+            TrayIconBuilder::with_id("main")
+                .icon(icon)
+                .menu(&menu)
+                .tooltip("Hubnity")
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                })
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "timer_toggle" => {
+                        let Some(timer_state) = app.try_state::<TimerState>() else {
+                            return;
+                        };
+                        let is_running = timer_state.is_running.load(Ordering::Relaxed);
+                        let sender = timer_state.sender.clone();
+                        if is_running {
+                            tauri::async_runtime::spawn(async move {
+                                let _ = sender.send(TimerCommand::Stop).await;
+                            });
+                        } else {
+                            let pool = match app.try_state::<sqlx::SqlitePool>() {
+                                Some(p) => p.inner().clone(),
+                                None => return,
+                            };
+                            tauri::async_runtime::spawn(async move {
+                                let last = sqlx::query_as::<_, (String,)>(
+                                    "SELECT project_id FROM time_slots ORDER BY id DESC LIMIT 1",
+                                )
+                                .fetch_optional(&pool)
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Some((project_id,)) = last {
+                                    let _ = sender
+                                        .send(TimerCommand::Start { project_id })
+                                        .await;
+                                }
+                            });
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+
+            app.manage(TrayState { timer_item });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -139,6 +229,7 @@ pub fn run() {
             reset_worker_timer,
             cmd_force_quit,
             cmd_stop_and_quit,
+            cmd_update_tray_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -181,7 +272,10 @@ async fn check_close_requested(app: tauri::AppHandle) {
             },
         );
     } else {
-        app.exit(0);
+        // Hide to tray instead of exiting; only "Quit" in tray menu exits fully
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
     }
 }
 

@@ -8,6 +8,11 @@ use crate::api::auth::{fetch_projects, login};
 use crate::db::models::{project::Project, user::User};
 use crate::timer::models::{TimerCommand, TimerState};
 
+/// Managed state holding the tray menu item that toggles Start/Stop
+pub struct TrayState {
+    pub timer_item: tauri::menu::MenuItem<tauri::Wry>,
+}
+
 /// Payload, отправляемый на фронт при попытке закрытия окна
 #[derive(Serialize, Clone)]
 pub struct CloseRequestedPayload {
@@ -95,6 +100,34 @@ pub async fn cmd_stop_and_quit(
     // Даём актору время записать чанк в SQLite
     tokio::time::sleep(Duration::from_millis(600)).await;
     app.exit(0);
+    Ok(())
+}
+
+/// Updates the tray tooltip and the Start/Stop menu item label on every timer tick.
+/// Called from the frontend's timer-tick listener.
+#[tauri::command]
+pub async fn cmd_update_tray_status(
+    app: tauri::AppHandle,
+    tray_state: State<'_, TrayState>,
+    is_running: bool,
+    time_str: String,
+) -> Result<(), String> {
+    // Update the menu item label
+    tray_state
+        .timer_item
+        .set_text(if is_running { "Stop Timer" } else { "Start Timer" })
+        .map_err(|e| e.to_string())?;
+
+    // Update tray tooltip
+    if let Some(tray) = app.tray_by_id("main") {
+        let tooltip = if is_running {
+            format!("Hubnity — {}", time_str)
+        } else {
+            "Hubnity".to_string()
+        };
+        tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 

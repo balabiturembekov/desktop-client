@@ -43,6 +43,10 @@ useEffect(() => {
     listen<TimerPayload>("timer-tick", (e) => {
       setTotalSecs(e.payload.total_secs);
       setIsRunning(e.payload.is_running);
+      invoke("cmd_update_tray_status", {
+        isRunning: e.payload.is_running,
+        timeStr: formatTime(e.payload.total_secs),
+      }).catch(() => {});
     }).then((fn) => (unlisten = fn));
 
     listen<void>("day-rollover", () => {
