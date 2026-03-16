@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use tauri::Emitter;
 use tauri::Manager;
 use tokio::sync::mpsc;
-
 mod api;
 mod app;
 mod db;
@@ -12,8 +12,8 @@ mod timer;
 mod tracker;
 
 use app::commands::{
-    cmd_get_current_user, cmd_get_projects, cmd_get_today_secs,
-    cmd_login, cmd_resume_after_idle, cmd_stop_after_idle,
+    cmd_get_current_user, cmd_get_projects, cmd_get_today_secs, cmd_login, cmd_resume_after_idle,
+    cmd_stop_after_idle,
 };
 use db::init_db;
 use screenshot::actor::screenshot_actor;
@@ -23,14 +23,9 @@ use timer::{
     commands::{reset_worker_timer, start_worker_timer, stop_worker_timer},
     models::TimerState,
 };
-use tracker::{
-    actor::activity_actor,
-    listener::start_listener,
-    models::ActivityState,
-};
+use tracker::{actor::activity_actor, listener::start_listener, models::ActivityState};
 
 pub fn run() {
-    // Инициализируем Sentry — перехватывает все паники и ошибки
     let _sentry = sentry::init((
         option_env!("SENTRY_DSN").unwrap_or(""),
         sentry::ClientOptions {
@@ -44,20 +39,29 @@ pub fn run() {
         },
     ));
 
+    sentry::capture_message("Hubnity started!", sentry::Level::Info);
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
 
-            let pool = tauri::async_runtime::block_on(init_db(&handle))
-                .expect("failed to init database");
+            // Проверяем обновления при старте — в фоне
+            let update_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                check_for_updates(update_handle).await;
+            });
+
+            let pool =
+                tauri::async_runtime::block_on(init_db(&handle)).expect("failed to init database");
 
             let screenshots_dir = app
                 .path()
                 .app_data_dir()
                 .expect("failed to get app data dir")
                 .join("screenshots");
-            std::fs::create_dir_all(&screenshots_dir)
-                .expect("failed to create screenshots dir");
+            std::fs::create_dir_all(&screenshots_dir).expect("failed to create screenshots dir");
 
             let is_running = Arc::new(AtomicBool::new(false));
             let activity_state = ActivityState::new();
@@ -113,4 +117,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+async fn check_for_updates(app: tauri::AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+
+    match app.updater() {
+        Ok(updater) => {
+            match updater.check().await {
+                Ok(Some(update)) => {
+                    println!("[updater] new version available: {}", update.version);
+                    // Уведомляем фронт
+                    let _ = app.emit("update-available", update.version.clone());
+
+                    // Скачиваем и устанавливаем
+                    match update.download_and_install(|_, _| {}, || {}).await {
+                        Ok(_) => {
+                            println!("[updater] update installed — restarting");
+                            app.restart();
+                        }
+                        Err(e) => {
+                            sentry::capture_message(
+                                &format!("Update install failed: {}", e),
+                                sentry::Level::Error,
+                            );
+                            eprintln!("[updater] install error: {}", e);
+                        }
+                    }
+                }
+                Ok(None) => println!("[updater] app is up to date"),
+                Err(e) => eprintln!("[updater] check error: {}", e),
+            }
+        }
+        Err(e) => eprintln!("[updater] init error: {}", e),
+    }
 }
