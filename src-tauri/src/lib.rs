@@ -39,7 +39,6 @@ pub fn run() {
         },
     ));
 
-    sentry::capture_message("Hubnity started!", sentry::Level::Info);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
