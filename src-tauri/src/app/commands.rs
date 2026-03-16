@@ -1,10 +1,19 @@
 use chrono::Utc;
+use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
+use tokio::time::Duration;
 
 use crate::api::auth::{fetch_projects, login};
 use crate::db::models::{project::Project, user::User};
 use crate::timer::models::{TimerCommand, TimerState};
+
+/// Payload, отправляемый на фронт при попытке закрытия окна
+#[derive(Serialize, Clone)]
+pub struct CloseRequestedPayload {
+    pub unsynced_count: i64,
+    pub timer_running: bool,
+}
 
 #[tauri::command]
 pub async fn cmd_login(
@@ -66,6 +75,27 @@ pub async fn cmd_get_today_secs(
     .await
     .map_err(|e| e.to_string())?;
     Ok(row.0.unwrap_or(0) as u64)
+}
+
+/// Немедленно завершает приложение без каких-либо проверок
+#[tauri::command]
+pub async fn cmd_force_quit(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
+}
+
+/// Останавливает таймер (сохраняет текущий чанк) и завершает приложение
+#[tauri::command]
+pub async fn cmd_stop_and_quit(
+    app: tauri::AppHandle,
+    state: State<'_, TimerState>,
+) -> Result<(), String> {
+    // Отправляем Stop — актор сохранит незаконченный чанк в DB
+    let _ = state.sender.send(TimerCommand::Stop).await;
+    // Даём актору время записать чанк в SQLite
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    app.exit(0);
+    Ok(())
 }
 
 fn close_idle_and_enable_main(app: &tauri::AppHandle) {

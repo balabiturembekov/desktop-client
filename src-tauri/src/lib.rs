@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
@@ -12,8 +12,8 @@ mod timer;
 mod tracker;
 
 use app::commands::{
-    cmd_get_current_user, cmd_get_projects, cmd_get_today_secs, cmd_login, cmd_resume_after_idle,
-    cmd_stop_after_idle,
+    cmd_force_quit, cmd_get_current_user, cmd_get_projects, cmd_get_today_secs, cmd_login,
+    cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, CloseRequestedPayload,
 };
 use db::init_db;
 use screenshot::actor::screenshot_actor;
@@ -107,6 +107,18 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    check_close_requested(app).await;
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             cmd_login,
             cmd_get_current_user,
@@ -117,9 +129,52 @@ pub fn run() {
             start_worker_timer,
             stop_worker_timer,
             reset_worker_timer,
+            cmd_force_quit,
+            cmd_stop_and_quit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Проверяет наличие несинхронизированных данных и запущенного таймера.
+/// Если всё чисто — завершает приложение. Иначе — отправляет событие на фронт.
+async fn check_close_requested(app: tauri::AppHandle) {
+    let (unsynced_count, timer_running) = {
+        let pool = match app.try_state::<sqlx::SqlitePool>() {
+            Some(p) => p.inner().clone(),
+            None => {
+                app.exit(0);
+                return;
+            }
+        };
+
+        let timer_running = app
+            .try_state::<timer::models::TimerState>()
+            .map(|s| s.is_running.load(Ordering::Relaxed))
+            .unwrap_or(false);
+
+        let count = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM time_slots WHERE synced = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .map(|(c,)| c)
+        .unwrap_or(0);
+
+        (count, timer_running)
+    };
+
+    if unsynced_count > 0 || timer_running {
+        let _ = app.emit(
+            "close-requested-with-unsynced",
+            CloseRequestedPayload {
+                unsynced_count,
+                timer_running,
+            },
+        );
+    } else {
+        app.exit(0);
+    }
 }
 
 async fn check_for_updates(app: tauri::AppHandle) {
