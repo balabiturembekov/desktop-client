@@ -29,3 +29,4 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+src-tauri/.env

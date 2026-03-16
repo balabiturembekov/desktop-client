@@ -30,3 +30,4 @@ log = "0.4.29"
 tauri-plugin-log = "2"
 device_query = "2.0"
 xcap = "0.9.1"
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }

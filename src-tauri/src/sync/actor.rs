@@ -21,7 +21,6 @@ pub async fn sync_actor(pool: SqlitePool) {
     }
 }
 
-/// Проверяет сеть — простой ping к API
 async fn is_online() -> bool {
     reqwest::Client::new()
         .get("https://api.hubnity.io/api/v1")
@@ -31,13 +30,10 @@ async fn is_online() -> bool {
         .is_ok()
 }
 
-/// Обновляет токен и сохраняет в БД
 async fn try_refresh(pool: &SqlitePool) -> Option<String> {
     let user = User::get_current(pool).await.ok()??;
-
     match refresh_token(&user.refresh_token).await {
         Ok(res) => {
-            // Сохраняем новые токены
             let _ = sqlx::query(
                 "UPDATE users SET access_token = ?, refresh_token = ? WHERE remote_id = ?",
             )
@@ -46,11 +42,14 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
             .bind(&user.remote_id)
             .execute(pool)
             .await;
-
             println!("[sync] token refreshed");
             Some(res.access_token)
         }
         Err(e) => {
+            sentry::capture_message(
+                &format!("Token refresh failed: {}", e),
+                sentry::Level::Error,
+            );
             eprintln!("[sync] token refresh failed: {}", e);
             None
         }
@@ -58,19 +57,15 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
 }
 
 async fn sync_pending(pool: &SqlitePool) {
-    // Проверяем сеть
     if !is_online().await {
-        println!("[sync] offline — skipping sync");
         return;
     }
 
-    // Получаем токен
     let user = match User::get_current(pool).await {
         Ok(Some(u)) => u,
         _ => return,
     };
 
-    // Получаем несинхронизированные слоты
     let slots = match sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
         r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
            FROM time_slots
@@ -81,7 +76,10 @@ async fn sync_pending(pool: &SqlitePool) {
     {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[sync] failed to fetch slots: {}", e);
+            sentry::capture_message(
+                &format!("Failed to fetch unsynced slots: {}", e),
+                sentry::Level::Error,
+            );
             return;
         }
     };
@@ -91,8 +89,6 @@ async fn sync_pending(pool: &SqlitePool) {
     }
 
     println!("[sync] syncing {} slots", slots.len());
-
-    // Используем текущий токен, при 401 — обновляем
     let mut token = user.access_token.clone();
 
     for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in slots {
@@ -104,37 +100,37 @@ async fn sync_pending(pool: &SqlitePool) {
             activity_percent,
         };
 
-        // Пробуем отправить — если 401 обновляем токен и повторяем
         let remote_id = match create_time_entry(&token, &entry).await {
             Ok(res) => res.id,
-            Err(e) if e.contains("401") => {
-                println!("[sync] 401 — refreshing token");
-                match try_refresh(pool).await {
-                    Some(new_token) => {
-                        token = new_token;
-                        match create_time_entry(&token, &entry).await {
-                            Ok(res) => res.id,
-                            Err(e) => {
-                                eprintln!("[sync] retry failed: {}", e);
-                                continue;
-                            }
+            Err(e) if e.contains("401") => match try_refresh(pool).await {
+                Some(new_token) => {
+                    token = new_token;
+                    match create_time_entry(&token, &entry).await {
+                        Ok(res) => res.id,
+                        Err(e) => {
+                            sentry::capture_message(
+                                &format!("Sync retry failed for slot {}: {}", slot_id, e),
+                                sentry::Level::Error,
+                            );
+                            continue;
                         }
                     }
-                    None => {
-                        eprintln!("[sync] refresh failed — skipping slot {}", slot_id);
-                        continue;
-                    }
                 }
-            }
+                None => continue,
+            },
             Err(e) => {
+                // 404 — endpoint ещё не готов, не шлём в Sentry
+                if !e.contains("404") {
+                    sentry::capture_message(
+                        &format!("Sync failed for slot {}: {}", slot_id, e),
+                        sentry::Level::Error,
+                    );
+                }
                 eprintln!("[sync] failed slot {}: {}", slot_id, e);
-                continue; // offline queue — попробуем в следующий раз
+                continue;
             }
         };
 
-        println!("[sync] time entry created: {}", remote_id);
-
-        // Загружаем скриншоты
         let screenshots = sqlx::query_as::<_, (i64, String)>(
             "SELECT id, file_path FROM screenshots WHERE time_slot_id = ? AND synced = 0",
         )
@@ -152,11 +148,16 @@ async fn sync_pending(pool: &SqlitePool) {
                         .execute(pool)
                         .await;
                 }
-                Err(e) => eprintln!("[sync] screenshot failed: {}", e),
+                Err(e) => {
+                    sentry::capture_message(
+                        &format!("Screenshot upload failed {}: {}", file_path, e),
+                        sentry::Level::Warning,
+                    );
+                    eprintln!("[sync] screenshot failed: {}", e);
+                }
             }
         }
 
-        // Помечаем слот синхронизированным
         let _ = sqlx::query("UPDATE time_slots SET synced = 1 WHERE id = ?")
             .bind(slot_id)
             .execute(pool)
@@ -176,14 +177,29 @@ async fn cleanup_old_data(pool: &SqlitePool) {
     .await
     .unwrap_or_default();
 
+    let mut deleted_files = 0;
+    let mut deleted_records = 0;
+
     for (id, file_path) in old_screenshots {
-        if let Err(e) = tokio::fs::remove_file(&file_path).await {
-            eprintln!("[cleanup] failed to delete file {}: {}", file_path, e);
+        match tokio::fs::remove_file(&file_path).await {
+            Ok(_) => deleted_files += 1,
+            Err(e) => eprintln!("[cleanup] file error {}: {}", file_path, e),
         }
-        let _ = sqlx::query("DELETE FROM screenshots WHERE id = ?")
+        if sqlx::query("DELETE FROM screenshots WHERE id = ?")
             .bind(id)
             .execute(pool)
-            .await;
+            .await
+            .is_ok()
+        {
+            deleted_records += 1;
+        }
+    }
+
+    if deleted_records > 0 {
+        println!(
+            "[cleanup] {} files, {} records removed",
+            deleted_files, deleted_records
+        );
     }
 
     let result = sqlx::query(

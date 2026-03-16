@@ -30,6 +30,20 @@ use tracker::{
 };
 
 pub fn run() {
+    // Инициализируем Sentry — перехватывает все паники и ошибки
+    let _sentry = sentry::init((
+        option_env!("SENTRY_DSN").unwrap_or(""),
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            environment: Some(if cfg!(debug_assertions) {
+                "development".into()
+            } else {
+                "production".into()
+            }),
+            ..Default::default()
+        },
+    ));
+
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
