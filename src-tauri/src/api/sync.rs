@@ -1,42 +1,78 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::app_tracker::models::AppUsagePayload;
-
 const BASE_URL: &str = "https://api.hubnity.io/api/v1";
 
 #[derive(Debug, Serialize)]
-pub struct TimeEntryRequest {
-    pub project_id: String,
+pub struct SyncAppUsage {
+    #[serde(rename = "appName")]
+    pub app_name: String,
+    #[serde(rename = "windowTitle")]
+    pub window_title: String,
+    #[serde(rename = "url")]
+    pub url: Option<String>,
+    #[serde(rename = "durationSeconds")]
+    pub duration_seconds: i64,
+    #[serde(rename = "startedAt")]
     pub started_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncTimeEntry {
+    #[serde(rename = "projectId")]
+    pub project_id: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: String,
+    #[serde(rename = "endedAt")]
     pub ended_at: String,
-    pub duration_secs: i64,
+    #[serde(rename = "durationSeconds")]
+    pub duration_seconds: i64,
+    #[serde(rename = "activityPercent")]
     pub activity_percent: i64,
+    #[serde(rename = "appUsage")]
+    pub app_usage: Vec<SyncAppUsage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncTimeEntriesRequest {
+    pub entries: Vec<SyncTimeEntry>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TimeEntryResponse {
+pub struct SyncEntryResult {
     pub id: String,
+    pub synced: bool,
+    #[serde(rename = "startedAt")]
+    pub started_at: String,
 }
 
-pub async fn create_time_entry(
+#[derive(Debug, Deserialize)]
+pub struct SyncTimeEntriesResponse {
+    pub synced: i64,
+    pub failed: i64,
+    pub entries: Vec<SyncEntryResult>,
+}
+
+pub async fn sync_time_entries(
     client: &Client,
     token: &str,
-    entry: &TimeEntryRequest,
-) -> Result<TimeEntryResponse, String> {
+    entries: Vec<SyncTimeEntry>,
+) -> Result<SyncTimeEntriesResponse, String> {
+    let body = SyncTimeEntriesRequest { entries };
+
     let res = client
-        .post(format!("{}/time-entries", BASE_URL))
+        .post(format!("{}/time-entries/sync", BASE_URL))
         .bearer_auth(token)
-        .json(entry)
+        .json(&body)
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
-        return Err(format!("Failed to create time entry: {}", res.status()));
+        return Err(format!("Sync failed: {}", res.status()));
     }
 
-    res.json::<TimeEntryResponse>()
+    res.json::<SyncTimeEntriesResponse>()
         .await
         .map_err(|e| e.to_string())
 }
@@ -73,7 +109,10 @@ pub async fn upload_screenshot(
         .text("activityData", activity_data.to_string());
 
     let res = client
-        .post(format!("{}/time-entries/{}/screenshots", BASE_URL, time_entry_id))
+        .post(format!(
+            "{}/time-entries/{}/screenshots",
+            BASE_URL, time_entry_id
+        ))
         .bearer_auth(token)
         .multipart(form)
         .send()
@@ -82,27 +121,6 @@ pub async fn upload_screenshot(
 
     if !res.status().is_success() {
         return Err(format!("Failed to upload screenshot: {}", res.status()));
-    }
-
-    Ok(())
-}
-
-pub async fn upload_app_usage(
-    client: &Client,
-    token: &str,
-    time_entry_id: &str,
-    usages: &[AppUsagePayload],
-) -> Result<(), String> {
-    let res = client
-        .post(format!("{}/time-entries/{}/app-usage", BASE_URL, time_entry_id))
-        .bearer_auth(token)
-        .json(usages)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !res.status().is_success() {
-        return Err(format!("Failed to upload app usage: {}", res.status()));
     }
 
     Ok(())
