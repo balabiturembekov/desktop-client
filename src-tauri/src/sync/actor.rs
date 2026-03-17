@@ -81,7 +81,7 @@ async fn build_entries(
     for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in &slots {
         let app_usages = sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
             "SELECT app_name, window_title, url, duration_secs, started_at \
-             FROM app_usage WHERE time_slot_id = ? AND synced = 0",
+             FROM app_usage WHERE time_slot_id = ? AND synced = 0 AND trim(app_name) != ''",
         )
         .bind(slot_id)
         .fetch_all(pool)
@@ -221,6 +221,14 @@ async fn sync_pending(pool: &SqlitePool) {
     // This catches app_usage/screenshots that were written after their slot
     // was already synced — which previously got stuck forever because this
     // block was only reachable when slot_ids was non-empty.
+
+    // Invalid app_usage: rows with empty app_name are skipped during sync but
+    // never marked synced, blocking all future cycles. Mark them done now.
+    let _ = sqlx::query(
+        "UPDATE app_usage SET synced = 1 WHERE synced = 0 AND trim(app_name) = ''",
+    )
+    .execute(pool)
+    .await;
 
     // Orphan app_usage: mark synced so they don't block future sync cycles.
     let orphan = sqlx::query(

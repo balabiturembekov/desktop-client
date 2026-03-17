@@ -67,7 +67,9 @@ pub async fn sync_time_entries(
         .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
-        return Err(format!("Sync failed: {}", res.status()));
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Sync failed: {} — {}", status, body));
     }
 
     res.json::<SyncTimeEntriesResponse>()
