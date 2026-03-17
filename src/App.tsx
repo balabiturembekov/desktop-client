@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 import LoginPage from "./pages/LoginPage";
 import TrackerPage from "./pages/TrackerPage";
 import { User } from "./types";
@@ -53,6 +58,21 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     listen<ClosePayload>("close-requested-with-unsynced", (e) => {
       setCloseModal(e.payload);
+    }).then((fn) => (unlisten = fn));
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("screenshot-taken", async () => {
+      let permissionGranted = await isPermissionGranted();
+      if (!permissionGranted) {
+        const permission = await requestPermission();
+        permissionGranted = permission === "granted";
+      }
+      if (permissionGranted) {
+        sendNotification({ title: "Hubnity", body: "Screenshot taken" });
+      }
     }).then((fn) => (unlisten = fn));
     return () => unlisten?.();
   }, []);

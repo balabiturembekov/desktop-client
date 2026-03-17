@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { User, Project, TimerPayload } from "../types";
@@ -23,6 +23,10 @@ export default function TrackerPage({ user, onLogout }: Props) {
   const [initialized, setInitialized] = useState(false);
   const [starting, setStarting] = useState(false);
 
+  // Refs for tray throttle — not state, so they don't trigger re-renders
+  const lastTrayUpdate = useRef<number>(0);
+  const lastTrayIsRunning = useRef<boolean | null>(null);
+
   useEffect(() => {
     // Загружаем проекты и today secs параллельно
     Promise.all([
@@ -43,10 +47,20 @@ useEffect(() => {
     listen<TimerPayload>("timer-tick", (e) => {
       setTotalSecs(e.payload.total_secs);
       setIsRunning(e.payload.is_running);
-      invoke("cmd_update_tray_status", {
-        isRunning: e.payload.is_running,
-        timeStr: formatTime(e.payload.total_secs),
-      }).catch(() => {});
+
+      // Throttle tray updates: call on is_running change OR every 10s.
+      // Calling set_text/set_tooltip every second causes a race condition
+      // in tao on macOS that crashes the process.
+      const now = Date.now();
+      const isRunningChanged = e.payload.is_running !== lastTrayIsRunning.current;
+      if (isRunningChanged || now - lastTrayUpdate.current >= 10_000) {
+        invoke("cmd_update_tray_status", {
+          isRunning: e.payload.is_running,
+          timeStr: formatTime(e.payload.total_secs),
+        }).catch(() => {});
+        lastTrayUpdate.current = now;
+        lastTrayIsRunning.current = e.payload.is_running;
+      }
     }).then((fn) => (unlisten = fn));
 
     listen<void>("day-rollover", () => {
