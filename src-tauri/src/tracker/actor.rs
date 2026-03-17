@@ -46,7 +46,8 @@ pub async fn activity_actor(
         let active = state.active_seconds.load(Ordering::Relaxed);
         let percent = if total > 0 { (active * 100) / total } else { 0 };
 
-        let _ = app.emit(
+        let _ = app.emit_to(
+            "main",
             "activity-tick",
             ActivityPayload {
                 active_seconds: active,

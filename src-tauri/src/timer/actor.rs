@@ -302,6 +302,13 @@ pub async fn time_actor(
                         running = false;
                         is_running_flag.store(false, Ordering::Relaxed);
 
+                        // Clear current_slot_id BEFORE deleting the stub row.
+                        // app_tracker_actor reads current_slot_id every 5s; if we delete
+                        // the row first, it can still read the old id and attempt an INSERT
+                        // into app_usage referencing a now-deleted time_slot, causing a
+                        // foreign-key error or silent data corruption.
+                        *current_slot_id.lock().await = None;
+
                         // Удаляем stub — прогресс сбрасывается
                         if let Some(sid) = stub_slot_id.take() {
                             let _ = sqlx::query("DELETE FROM time_slots WHERE id = ? AND synced = 0")
@@ -319,7 +326,6 @@ pub async fn time_actor(
                         last_progress_save = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
-                        *current_slot_id.lock().await = None;
                         today_secs_cache = get_today_secs(&pool).await;
                         current_day = day_key(&Local::now());
                         let _ = app.emit("timer-tick", TimerPayload {
