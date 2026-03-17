@@ -16,8 +16,9 @@ mod tracker;
 
 use app::commands::{
     cmd_download_and_install, cmd_force_quit, cmd_get_current_user, cmd_get_projects,
-    cmd_get_today_secs, cmd_login, cmd_restart_app, cmd_resume_after_idle, cmd_stop_after_idle,
-    cmd_stop_and_quit, cmd_update_tray_status, CloseRequestedPayload, TrayState,
+    cmd_get_today_secs, cmd_login, cmd_open_accessibility_settings, cmd_restart_app,
+    cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, cmd_update_tray_status,
+    CloseRequestedPayload, TrayState,
 };
 use app_tracker::actor::app_tracker_actor;
 use db::init_db;
@@ -247,6 +248,7 @@ pub fn run() {
             reset_worker_timer,
             cmd_force_quit,
             cmd_restart_app,
+            cmd_open_accessibility_settings,
             cmd_stop_and_quit,
             cmd_update_tray_status,
             cmd_download_and_install,

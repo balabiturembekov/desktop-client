@@ -6,7 +6,6 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import LoginPage from "./pages/LoginPage";
 import TrackerPage from "./pages/TrackerPage";
 import { User } from "./types";
@@ -164,11 +163,7 @@ export default function App() {
                 Accessibility permission required for activity tracking
               </p>
               <button
-                onClick={() =>
-                  openUrl(
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-                  ).catch(() => {})
-                }
+                onClick={() => invoke("cmd_open_accessibility_settings").catch(console.error)}
                 className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
               >
                 Open Settings

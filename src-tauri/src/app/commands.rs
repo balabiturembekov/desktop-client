@@ -100,6 +100,36 @@ pub async fn cmd_restart_app(app: tauri::AppHandle) -> Result<(), String> {
     app.restart()
 }
 
+/// Opens the macOS Accessibility privacy pane in System Settings / System Preferences.
+/// Uses the `open` CLI instead of a URL scheme so it works across all macOS versions
+/// (the x-apple.systempreferences: deep-link URL changed in macOS 13 Ventura).
+#[tauri::command]
+pub async fn cmd_open_accessibility_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Try the new System Settings deep link (macOS 13+) first, then fall back
+        // to the legacy System Preferences URL (macOS 12 and earlier).
+        let new_url =
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility";
+        let legacy_url =
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+        let ok = std::process::Command::new("open")
+            .arg(new_url)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !ok {
+            std::process::Command::new("open")
+                .arg(legacy_url)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Немедленно завершает приложение без каких-либо проверок
 #[tauri::command]
 pub async fn cmd_force_quit(app: tauri::AppHandle) -> Result<(), String> {
