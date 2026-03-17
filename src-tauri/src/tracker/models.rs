@@ -1,15 +1,20 @@
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
 
-/// Расшариваемое состояние между rdev thread и timer actor
+/// Shared state between the listener thread and the async actors.
 #[derive(Clone)]
 pub struct ActivityState {
-    /// Была ли активность в текущую секунду
+    /// Set to true by the listener on each input event.
+    /// Consumed (swap → false) only by activity_actor for counting.
     pub activity_flag: Arc<AtomicBool>,
-    /// Счётчик активных секунд в текущем 10-минутном интервале
+    /// Active-input seconds in the current 10-minute interval.
     pub active_seconds: Arc<AtomicU32>,
-    /// Счётчик всего секунд прошло в интервале (макс 600)
+    /// Total elapsed seconds in the current 10-minute interval (max 600).
     pub total_seconds: Arc<AtomicU32>,
+    /// Unix timestamp (seconds) of the most recent input event.
+    /// Written by the listener; read by time_actor for idle detection.
+    /// Separate from activity_flag so the two actors don't race on the same flag.
+    pub last_activity_secs: Arc<AtomicU64>,
 }
 
 impl ActivityState {
@@ -18,6 +23,7 @@ impl ActivityState {
             activity_flag: Arc::new(AtomicBool::new(false)),
             active_seconds: Arc::new(AtomicU32::new(0)),
             total_seconds: Arc::new(AtomicU32::new(0)),
+            last_activity_secs: Arc::new(AtomicU64::new(0)),
         }
     }
 }

@@ -42,8 +42,6 @@ pub struct SyncTimeEntriesRequest {
 pub struct SyncEntryResult {
     pub id: String,
     pub synced: bool,
-    #[serde(rename = "startedAt")]
-    pub started_at: String,
 }
 
 #[derive(Debug, Deserialize)]

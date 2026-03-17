@@ -1,13 +1,16 @@
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use device_query::{DeviceQuery, DeviceState};
 use crate::tracker::models::ActivityState;
 
+/// Minimum mouse displacement (squared) to count as intentional movement.
+/// Filters out hardware jitter / resting-hand micro-movements.
+/// 5 px threshold → 5² = 25.
+const MOUSE_THRESHOLD_SQ: i32 = 25;
+
 pub fn start_listener(state: ActivityState) {
-    // device_query паникует если нет Accessibility permissions
-    let result = std::panic::catch_unwind(|| {
-        DeviceState::new()
-    });
+    // device_query panics if Accessibility permissions are not granted on macOS.
+    let result = std::panic::catch_unwind(DeviceState::new);
 
     let device_state = match result {
         Ok(ds) => ds,
@@ -17,7 +20,6 @@ pub fn start_listener(state: ActivityState) {
                 sentry::Level::Warning,
             );
             eprintln!("[tracker] Accessibility permissions not granted — activity tracking disabled");
-            // Не паникуем — просто выходим из треда
             return;
         }
     };
@@ -29,12 +31,19 @@ pub fn start_listener(state: ActivityState) {
         let mouse = device_state.get_mouse();
         let keys = device_state.get_keys();
 
-        let mouse_moved = mouse.coords != last_mouse_pos;
+        let dx = mouse.coords.0 - last_mouse_pos.0;
+        let dy = mouse.coords.1 - last_mouse_pos.1;
+        let mouse_moved = dx * dx + dy * dy > MOUSE_THRESHOLD_SQ;
         let new_key = keys.iter().any(|k| !last_keys.contains(k));
         let mouse_clicked = mouse.button_pressed.iter().any(|&b| b);
 
         if mouse_moved || new_key || mouse_clicked {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             state.activity_flag.store(true, Ordering::Relaxed);
+            state.last_activity_secs.store(now_secs, Ordering::Relaxed);
         }
 
         last_mouse_pos = mouse.coords;

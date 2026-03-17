@@ -8,9 +8,12 @@ use crate::api::auth::{fetch_projects, login};
 use crate::db::models::{project::Project, user::User};
 use crate::timer::models::{TimerCommand, TimerState};
 
-/// Managed state holding the tray menu item that toggles Start/Stop
+/// Managed state holding the tray menu item that toggles Start/Stop.
+/// `last_tooltip` caches the last value written to the tray so we can skip
+/// redundant set_text / set_tooltip calls (avoids a macOS/tao race condition).
 pub struct TrayState {
     pub timer_item: tauri::menu::MenuItem<tauri::Wry>,
+    pub last_tooltip: std::sync::Mutex<Option<(bool, String)>>,
 }
 
 /// Payload, отправляемый на фронт при попытке закрытия окна
@@ -110,8 +113,11 @@ pub async fn cmd_stop_and_quit(
     Ok(())
 }
 
-/// Updates the tray tooltip and the Start/Stop menu item label on every timer tick.
-/// Called from the frontend's timer-tick listener.
+/// Updates the tray tooltip and the Start/Stop menu item label.
+/// Called from the frontend at most once per state-change or every 10 s.
+/// Skips redundant writes (same is_running + same tooltip) to avoid the
+/// macOS/tao race condition that occurs when set_text/set_tooltip are called
+/// too frequently from a background thread.
 #[tauri::command]
 pub async fn cmd_update_tray_status(
     app: tauri::AppHandle,
@@ -119,6 +125,24 @@ pub async fn cmd_update_tray_status(
     is_running: bool,
     time_str: String,
 ) -> Result<(), String> {
+    let tooltip = if is_running {
+        format!("Hubnity — {}", time_str)
+    } else {
+        "Hubnity".to_string()
+    };
+
+    // De-duplicate: skip if nothing changed since last call.
+    {
+        let mut cache = tray_state
+            .last_tooltip
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if cache.as_ref() == Some(&(is_running, tooltip.clone())) {
+            return Ok(());
+        }
+        *cache = Some((is_running, tooltip.clone()));
+    }
+
     // Update the menu item label
     tray_state
         .timer_item
@@ -127,11 +151,6 @@ pub async fn cmd_update_tray_status(
 
     // Update tray tooltip
     if let Some(tray) = app.tray_by_id("main") {
-        let tooltip = if is_running {
-            format!("Hubnity — {}", time_str)
-        } else {
-            "Hubnity".to_string()
-        };
         tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())?;
     }
 

@@ -46,6 +46,7 @@ pub fn run() {
 
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
@@ -99,11 +100,11 @@ pub fn run() {
             tauri::async_runtime::spawn(activity_actor(
                 activity_state,
                 handle.clone(),
-                pool.clone(),
                 is_running.clone(),
             ));
 
             tauri::async_runtime::spawn(screenshot_actor(
+                handle.clone(),
                 pool.clone(),
                 screenshots_dir,
                 is_running.clone(),
@@ -205,7 +206,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            app.manage(TrayState { timer_item });
+            app.manage(TrayState { timer_item, last_tooltip: std::sync::Mutex::new(None) });
 
             Ok(())
         })

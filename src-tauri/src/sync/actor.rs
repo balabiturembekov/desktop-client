@@ -5,6 +5,9 @@ use crate::api::auth::refresh_token;
 use crate::api::sync::{sync_time_entries, upload_screenshot, SyncAppUsage, SyncTimeEntry};
 use crate::db::models::user::User;
 
+/// Max slots to sync per cycle — prevents loading thousands of rows into memory.
+const SYNC_BATCH_LIMIT: i64 = 50;
+
 pub async fn sync_actor(pool: SqlitePool) {
     let mut sync_tick = interval(Duration::from_secs(30));
     let mut cleanup_tick = interval(Duration::from_secs(3600));
@@ -56,6 +59,60 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
     }
 }
 
+/// Fetches pending slots from DB and builds entries for bulk sync.
+/// ORDER BY id ensures stable ordering so response indices match slot_ids.
+async fn build_entries(
+    pool: &SqlitePool,
+) -> Result<(Vec<SyncTimeEntry>, Vec<i64>), sqlx::Error> {
+    let slots = sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
+        r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
+           FROM time_slots
+           WHERE synced = 0 AND ended_at IS NOT NULL AND duration_secs > 0
+           ORDER BY id
+           LIMIT ?"#,
+    )
+    .bind(SYNC_BATCH_LIMIT)
+    .fetch_all(pool)
+    .await?;
+
+    let mut entries = Vec::with_capacity(slots.len());
+    let mut slot_ids = Vec::with_capacity(slots.len());
+
+    for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in &slots {
+        let app_usages = sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
+            "SELECT app_name, window_title, url, duration_secs, started_at \
+             FROM app_usage WHERE time_slot_id = ? AND synced = 0",
+        )
+        .bind(slot_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        entries.push(SyncTimeEntry {
+            project_id: project_id.clone(),
+            started_at: started_at.clone(),
+            ended_at: ended_at.clone(),
+            duration_seconds: *duration_secs,
+            activity_percent: *activity_percent,
+            app_usage: app_usages
+                .into_iter()
+                .map(|(app_name, window_title, url, duration_seconds, started_at)| {
+                    SyncAppUsage {
+                        app_name,
+                        window_title,
+                        url,
+                        duration_seconds,
+                        started_at,
+                    }
+                })
+                .collect(),
+        });
+        slot_ids.push(*slot_id);
+    }
+
+    Ok((entries, slot_ids))
+}
+
 async fn sync_pending(pool: &SqlitePool) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -72,134 +129,38 @@ async fn sync_pending(pool: &SqlitePool) {
         _ => return,
     };
 
-    // Берём все несинхронизированные завершённые слоты
-    let slots = match sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
-        r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
-           FROM time_slots
-           WHERE synced = 0 AND ended_at IS NOT NULL AND duration_secs > 0"#,
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(s) => s,
+    let (entries, slot_ids) = match build_entries(pool).await {
+        Ok(pair) if !pair.1.is_empty() => pair,
+        Ok(_) => return,
         Err(e) => {
             log::error!("[sync] failed to fetch slots: {}", e);
             return;
         }
     };
 
-    if slots.is_empty() {
-        return;
-    }
-
-    log::info!("[sync] syncing {} slots", slots.len());
+    log::info!("[sync] syncing {} slots", slot_ids.len());
     let mut token = user.access_token.clone();
 
-    // Собираем все слоты в один bulk запрос
-    let mut entries: Vec<SyncTimeEntry> = vec![];
-    let mut slot_ids: Vec<i64> = vec![];
-
-    for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in &slots {
-        // Загружаем app_usage для слота
-        let app_usages = sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
-            "SELECT app_name, window_title, url, duration_secs, started_at FROM app_usage WHERE time_slot_id = ? AND synced = 0",
-        )
-        .bind(slot_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-
-        let app_usage: Vec<SyncAppUsage> = app_usages
-            .into_iter()
-            .map(
-                |(app_name, window_title, url, duration_seconds, started_at)| SyncAppUsage {
-                    app_name,
-                    window_title,
-                    url,
-                    duration_seconds,
-                    started_at,
-                },
-            )
-            .collect();
-
-        entries.push(SyncTimeEntry {
-            project_id: project_id.clone(),
-            started_at: started_at.clone(),
-            ended_at: ended_at.clone(),
-            duration_seconds: *duration_secs,
-            activity_percent: *activity_percent,
-            app_usage,
-        });
-        slot_ids.push(*slot_id);
-    }
-
-    // Отправляем bulk запрос
-    let response = match sync_time_entries(&client, &token, entries).await {
-        Ok(res) => res,
+    // On 401: refresh token and re-fetch entries.
+    // Re-fetching is safe because ORDER BY id + same LIMIT returns the same rows.
+    // Critically, we also get a fresh slot_ids so indices stay consistent with
+    // the entries we send on retry.
+    let (response, slot_ids) = match sync_time_entries(&client, &token, entries).await {
+        Ok(res) => (res, slot_ids),
         Err(e) if e.contains("401") => {
             log::info!("[sync] 401 — refreshing token");
             match try_refresh(pool).await {
                 Some(new_token) => {
-                    token = new_token.clone();
-                    // Пересобираем entries после refresh
-                    let slots2 = match sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
-                        r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
-                           FROM time_slots
-                           WHERE synced = 0 AND ended_at IS NOT NULL AND duration_secs > 0"#,
-                    )
-                    .fetch_all(pool)
-                    .await {
-                        Ok(s) => s,
-                        Err(_) => return,
+                    token = new_token;
+                    let (entries2, slot_ids2) = match build_entries(pool).await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            log::error!("[sync] rebuild after 401 failed: {}", e);
+                            return;
+                        }
                     };
-
-                    let mut entries2: Vec<SyncTimeEntry> = vec![];
-                    for (
-                        slot_id,
-                        project_id,
-                        started_at,
-                        ended_at,
-                        duration_secs,
-                        activity_percent,
-                    ) in &slots2
-                    {
-                        let app_usages = sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
-                            "SELECT app_name, window_title, url, duration_secs, started_at FROM app_usage WHERE time_slot_id = ? AND synced = 0",
-                        )
-                        .bind(slot_id)
-                        .fetch_all(pool)
-                        .await
-                        .unwrap_or_default();
-
-                        entries2.push(SyncTimeEntry {
-                            project_id: project_id.clone(),
-                            started_at: started_at.clone(),
-                            ended_at: ended_at.clone(),
-                            duration_seconds: *duration_secs,
-                            activity_percent: *activity_percent,
-                            app_usage: app_usages
-                                .into_iter()
-                                .map(
-                                    |(
-                                        app_name,
-                                        window_title,
-                                        url,
-                                        duration_seconds,
-                                        started_at,
-                                    )| SyncAppUsage {
-                                        app_name,
-                                        window_title,
-                                        url,
-                                        duration_seconds,
-                                        started_at,
-                                    },
-                                )
-                                .collect(),
-                        });
-                    }
-
-                    match sync_time_entries(&client, &new_token, entries2).await {
-                        Ok(res) => res,
+                    match sync_time_entries(&client, &token, entries2).await {
+                        Ok(res) => (res, slot_ids2),
                         Err(e) => {
                             log::error!("[sync] retry failed: {}", e);
                             return;
@@ -224,61 +185,121 @@ async fn sync_pending(pool: &SqlitePool) {
         response.failed
     );
 
-    // Обновляем статус синхронизированных слотов
+    // Mark synced slots, store remote_id, upload screenshots.
+    // response.entries is ordered the same as our request (backend preserves order).
     for (i, result) in response.entries.iter().enumerate() {
-        if result.synced && i < slot_ids.len() {
-            let slot_id = slot_ids[i];
-            let remote_id = &result.id;
+        if !result.synced || i >= slot_ids.len() {
+            continue;
+        }
+        let slot_id = slot_ids[i];
+        let remote_id = &result.id;
 
-            // Помечаем слот как синхронизированный
-            let _ = sqlx::query("UPDATE time_slots SET synced = 1 WHERE id = ?")
-                .bind(slot_id)
-                .execute(pool)
-                .await;
+        let _ = sqlx::query(
+            "UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?",
+        )
+        .bind(remote_id)
+        .bind(slot_id)
+        .execute(pool)
+        .await;
 
-            // Помечаем app_usage как синхронизированный
-            let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
-                .bind(slot_id)
-                .execute(pool)
-                .await;
-
-            // Загружаем скриншоты для этого слота
-            let screenshots = sqlx::query_as::<_, (i64, String)>(
-                "SELECT id, file_path FROM screenshots WHERE time_slot_id = ? AND synced = 0",
-            )
+        let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
             .bind(slot_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+            .execute(pool)
+            .await;
 
-            for (screenshot_id, file_path) in screenshots {
-                let activity_percent = slots
-                    .iter()
-                    .find(|(id, ..)| *id == slot_id)
-                    .map(|(_, _, _, _, _, ap)| *ap)
-                    .unwrap_or(0);
+        upload_slot_screenshots(pool, &client, &token, slot_id, remote_id).await;
 
-                match upload_screenshot(&client, &token, remote_id, &file_path, activity_percent)
-                    .await
-                {
-                    Ok(_) => {
-                        log::info!("[sync] screenshot uploaded: {}", file_path);
-                        let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
-                            .bind(screenshot_id)
-                            .execute(pool)
-                            .await;
-                    }
-                    Err(e) => {
-                        sentry::capture_message(
-                            &format!("Screenshot upload failed: {}", e),
-                            sentry::Level::Warning,
-                        );
-                        log::warn!("[sync] screenshot failed: {}", e);
-                    }
+        log::info!("[sync] slot {} → remote {} ✓", slot_id, remote_id);
+    }
+
+    // Orphan app_usage: rows written to an already-synced slot after sync ran.
+    let orphan = sqlx::query(
+        "UPDATE app_usage SET synced = 1 \
+         WHERE synced = 0 \
+         AND time_slot_id IN (SELECT id FROM time_slots WHERE synced = 1)",
+    )
+    .execute(pool)
+    .await;
+
+    match orphan {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!(
+                "[sync] marked {} orphan app_usage rows as synced",
+                r.rows_affected()
+            );
+        }
+        Err(e) => log::warn!("[sync] orphan app_usage cleanup failed: {}", e),
+        _ => {}
+    }
+
+    // Orphan screenshots: upload previously failed screenshots for synced slots.
+    // remote_id is now stored in time_slots so we can retry without re-syncing the entry.
+    let orphan_screenshots = sqlx::query_as::<_, (i64, String, String, i64)>(
+        r#"SELECT s.id, s.file_path, t.remote_id, t.activity_percent
+           FROM screenshots s
+           JOIN time_slots t ON t.id = s.time_slot_id
+           WHERE s.synced = 0 AND t.synced = 1 AND t.remote_id IS NOT NULL"#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if !orphan_screenshots.is_empty() {
+        log::info!(
+            "[sync] retrying {} orphan screenshots",
+            orphan_screenshots.len()
+        );
+        for (screenshot_id, file_path, remote_id, activity_percent) in orphan_screenshots {
+            match upload_screenshot(&client, &token, &remote_id, &file_path, activity_percent)
+                .await
+            {
+                Ok(_) => {
+                    log::info!("[sync] orphan screenshot uploaded: {}", file_path);
+                    let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
+                        .bind(screenshot_id)
+                        .execute(pool)
+                        .await;
                 }
+                Err(e) => log::warn!("[sync] orphan screenshot failed: {}", e),
             }
+        }
+    }
+}
 
-            log::info!("[sync] slot {} → remote {} ✓", slot_id, remote_id);
+async fn upload_slot_screenshots(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    token: &str,
+    slot_id: i64,
+    remote_id: &str,
+) {
+    let screenshots = sqlx::query_as::<_, (i64, String, i64)>(
+        r#"SELECT s.id, s.file_path, t.activity_percent
+           FROM screenshots s
+           JOIN time_slots t ON t.id = s.time_slot_id
+           WHERE s.time_slot_id = ? AND s.synced = 0"#,
+    )
+    .bind(slot_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (screenshot_id, file_path, activity_percent) in screenshots {
+        match upload_screenshot(client, token, remote_id, &file_path, activity_percent).await {
+            Ok(_) => {
+                log::info!("[sync] screenshot uploaded: {}", file_path);
+                let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
+                    .bind(screenshot_id)
+                    .execute(pool)
+                    .await;
+            }
+            Err(e) => {
+                sentry::capture_message(
+                    &format!("Screenshot upload failed: {}", e),
+                    sentry::Level::Warning,
+                );
+                log::warn!("[sync] screenshot failed: {}", e);
+            }
         }
     }
 }
