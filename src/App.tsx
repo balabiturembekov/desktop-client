@@ -31,6 +31,8 @@ export default function App() {
   const [closeModal, setCloseModal] = useState<ClosePayload | null>(null);
   const [closing, setClosing] = useState(false);
   const [accessibilityDenied, setAccessibilityDenied] = useState(false);
+  // true once user opened System Settings — macOS needs a restart to apply the permission
+  const [accessibilityNeedsRestart, setAccessibilityNeedsRestart] = useState(false);
 
   useEffect(() => {
     invoke<User | null>("cmd_get_current_user")
@@ -67,13 +69,23 @@ export default function App() {
   useEffect(() => {
     let unlistenDenied: (() => void) | undefined;
     let unlistenGranted: (() => void) | undefined;
-    listen("accessibility-denied", () => setAccessibilityDenied(true))
-      .then((fn) => (unlistenDenied = fn));
-    listen("accessibility-granted", () => setAccessibilityDenied(false))
-      .then((fn) => (unlistenGranted = fn));
+    let unlistenNeedsRestart: (() => void) | undefined;
+    listen("accessibility-denied", () => {
+      setAccessibilityDenied(true);
+    }).then((fn) => (unlistenDenied = fn));
+    listen("accessibility-granted", () => {
+      setAccessibilityDenied(false);
+      setAccessibilityNeedsRestart(false);
+    }).then((fn) => (unlistenGranted = fn));
+    // Fired when AXIsProcessTrusted()=true but device_query still fails —
+    // the OS granted the permission but the running process needs a restart to see it.
+    listen("accessibility-needs-restart", () => {
+      setAccessibilityNeedsRestart(true);
+    }).then((fn) => (unlistenNeedsRestart = fn));
     return () => {
       unlistenDenied?.();
       unlistenGranted?.();
+      unlistenNeedsRestart?.();
     };
   }, []);
 
@@ -128,25 +140,41 @@ export default function App() {
   return (
     <>
       {/* Accessibility permission banner — top, persistent until resolved */}
-      {accessibilityDenied && (
+      {(accessibilityDenied || accessibilityNeedsRestart) && (
         <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e1208] border-b border-[#4a2e0a] px-4 py-2.5 flex items-center gap-3">
           <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
             <path d="M8 2L14 13H2L8 2Z" stroke="#f59e0b" strokeWidth="1.5" strokeLinejoin="round"/>
             <path d="M8 7v3M8 11.5v.5" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
           </svg>
-          <p className="flex-1 text-xs text-[#f59e0b]">
-            Accessibility permission required for activity tracking
-          </p>
-          <button
-            onClick={() =>
-              openUrl(
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-              ).catch(() => {})
-            }
-            className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
-          >
-            Open Settings
-          </button>
+          {accessibilityNeedsRestart ? (
+            <>
+              <p className="flex-1 text-xs text-[#f59e0b]">
+                Permission granted — restart Hubnity to apply
+              </p>
+              <button
+                onClick={() => invoke("cmd_restart_app").catch(() => {})}
+                className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
+              >
+                Restart now
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="flex-1 text-xs text-[#f59e0b]">
+                Accessibility permission required for activity tracking
+              </p>
+              <button
+                onClick={() =>
+                  openUrl(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                  ).catch(() => {})
+                }
+                className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
+              >
+                Open Settings
+              </button>
+            </>
+          )}
         </div>
       )}
 

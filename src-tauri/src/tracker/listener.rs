@@ -48,14 +48,28 @@ pub fn start_listener(state: ActivityState, app: AppHandle) {
         }
 
         // Accessibility is granted — create DeviceState.
-        // Still wrapped in catch_unwind as a safety net for unexpected device_query internals.
-        let device_state = match std::panic::catch_unwind(DeviceState::new) {
+        //
+        // Suppress the sentry panic hook for this call: device_query's DeviceState::new
+        // panics with "This app does not have Accessibility Permissions" when the OS hasn't
+        // propagated the permission to the running process yet (a macOS TCC behaviour —
+        // the permission is visible to new processes but not to the current one until restart).
+        // We catch that panic ourselves, so we don't want sentry to report it as a fatal crash.
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence during the guarded call
+        let device_state_result = std::panic::catch_unwind(AssertUnwindSafe(DeviceState::new));
+        std::panic::set_hook(old_hook);
+
+        let device_state = match device_state_result {
             Ok(ds) => ds,
             Err(_) => {
+                // AXIsProcessTrusted() returned true but device_query still failed.
+                // This happens on macOS when the user JUST granted the permission — the TCC
+                // subsystem marks it granted but the running process won't see it until restart.
                 log::warn!(
-                    "[tracker] DeviceState::new failed unexpectedly — retrying in {}s",
-                    RETRY_SECS
+                    "[tracker] DeviceState::new failed despite AXIsProcessTrusted()=true \
+                     — permission likely granted but needs app restart to take effect"
                 );
+                let _ = app.emit("accessibility-needs-restart", ());
                 std::thread::sleep(Duration::from_secs(RETRY_SECS));
                 continue;
             }

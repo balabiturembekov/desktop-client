@@ -92,6 +92,14 @@ pub async fn cmd_get_today_secs(
     Ok(row.0.unwrap_or(0) as u64)
 }
 
+/// Restarts the app. Used when a system permission (e.g. Accessibility) is granted
+/// in System Preferences — macOS only propagates the change to new processes,
+/// so a restart is required for the running app to see it.
+#[tauri::command]
+pub async fn cmd_restart_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.restart()
+}
+
 /// Немедленно завершает приложение без каких-либо проверок
 #[tauri::command]
 pub async fn cmd_force_quit(app: tauri::AppHandle) -> Result<(), String> {
