@@ -75,7 +75,10 @@ async fn take_screenshot(
                         log::info!(
                             "[screenshot] saved ({label}): {path_str} (slot {slot_id})"
                         );
-                        let _ = app.emit("screenshot-taken", &path_str);
+                        // emit_to("main") instead of emit() to avoid broadcasting to
+                        // the "idle" window — both load App.tsx and would each fire
+                        // a separate system notification, producing duplicate alerts.
+                        let _ = app.emit_to("main", "screenshot-taken", &path_str);
                     }
                     Err(e) => log::error!(
                         "[screenshot] db insert failed ({label}): {e} (slot {slot_id})"
