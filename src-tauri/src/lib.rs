@@ -92,9 +92,10 @@ pub fn run() {
             });
 
             let listener_state = activity_state.clone();
+            let listener_handle = handle.clone();
             std::thread::Builder::new()
                 .name("activity-listener".to_string())
-                .spawn(move || start_listener(listener_state))
+                .spawn(move || start_listener(listener_state, listener_handle))
                 .expect("failed to spawn activity listener thread");
 
             tauri::async_runtime::spawn(activity_actor(
