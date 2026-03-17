@@ -173,13 +173,15 @@ pub async fn cmd_download_and_install(app: tauri::AppHandle) -> Result<(), Strin
     log::info!("[updater] downloading update {}", update.version);
 
     let app_for_progress = app.clone();
+    let mut downloaded_total: u64 = 0;
     update
         .download_and_install(
-            move |downloaded, total| {
+            move |chunk_size, total| {
+                downloaded_total += chunk_size as u64;
                 let _ = app_for_progress.emit(
                     "update-progress",
                     UpdateProgressPayload {
-                        downloaded: downloaded as u64,
+                        downloaded: downloaded_total,
                         total: total.unwrap_or(0),
                     },
                 );
