@@ -217,6 +217,16 @@ pub async fn time_actor(
                 match cmd {
                     Some(TimerCommand::Start { project_id }) => {
                         if !running {
+                            // If the idle window is still open (e.g. user started timer from
+                            // the tray menu), close it and re-enable main. The Destroyed handler
+                            // in lib.rs also re-enables main, so this is a belt-and-suspenders guard.
+                            if let Some(idle) = app.get_webview_window("idle") {
+                                let _ = idle.close();
+                            }
+                            if let Some(main) = app.get_webview_window("main") {
+                                let _ = main.set_enabled(true);
+                            }
+
                             today_secs_cache = get_today_secs(&pool).await;
                             current_day = day_key(&Local::now());
                             running = true;
@@ -254,6 +264,14 @@ pub async fn time_actor(
                         if running {
                             running = false;
                             is_running_flag.store(false, Ordering::Relaxed);
+                            // Ensure idle window is gone and main is re-enabled
+                            // (covers tray "Stop" while idle dialog is showing).
+                            if let Some(idle) = app.get_webview_window("idle") {
+                                let _ = idle.close();
+                            }
+                            if let Some(main) = app.get_webview_window("main") {
+                                let _ = main.set_enabled(true);
+                            }
 
                             let started_at_opt = chunk_started_at.take();
                             let sid = stub_slot_id.take();

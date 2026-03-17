@@ -212,6 +212,18 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // If the idle window is destroyed by any means (cmd+W, OS, or programmatically)
+            // without going through cmd_resume_after_idle / cmd_stop_after_idle,
+            // ensure the main window is re-enabled so it doesn't stay frozen forever.
+            if window.label() == "idle" {
+                if let tauri::WindowEvent::Destroyed = event {
+                    if let Some(main) = window.app_handle().get_webview_window("main") {
+                        let _ = main.set_enabled(true);
+                    }
+                }
+                return;
+            }
+
             if window.label() != "main" {
                 return;
             }
