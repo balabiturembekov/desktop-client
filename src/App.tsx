@@ -6,6 +6,7 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import LoginPage from "./pages/LoginPage";
 import TrackerPage from "./pages/TrackerPage";
 import { User } from "./types";
@@ -29,6 +30,7 @@ export default function App() {
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null);
   const [closeModal, setCloseModal] = useState<ClosePayload | null>(null);
   const [closing, setClosing] = useState(false);
+  const [accessibilityDenied, setAccessibilityDenied] = useState(false);
 
   useEffect(() => {
     invoke<User | null>("cmd_get_current_user")
@@ -60,6 +62,19 @@ export default function App() {
       setCloseModal(e.payload);
     }).then((fn) => (unlisten = fn));
     return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    let unlistenDenied: (() => void) | undefined;
+    let unlistenGranted: (() => void) | undefined;
+    listen("accessibility-denied", () => setAccessibilityDenied(true))
+      .then((fn) => (unlistenDenied = fn));
+    listen("accessibility-granted", () => setAccessibilityDenied(false))
+      .then((fn) => (unlistenGranted = fn));
+    return () => {
+      unlistenDenied?.();
+      unlistenGranted?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -112,6 +127,29 @@ export default function App() {
 
   return (
     <>
+      {/* Accessibility permission banner — top, persistent until resolved */}
+      {accessibilityDenied && (
+        <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e1208] border-b border-[#4a2e0a] px-4 py-2.5 flex items-center gap-3">
+          <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M8 2L14 13H2L8 2Z" stroke="#f59e0b" strokeWidth="1.5" strokeLinejoin="round"/>
+            <path d="M8 7v3M8 11.5v.5" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
+          </svg>
+          <p className="flex-1 text-xs text-[#f59e0b]">
+            Accessibility permission required for activity tracking
+          </p>
+          <button
+            onClick={() =>
+              openUrl(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+              ).catch(() => {})
+            }
+            className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
+          >
+            Open Settings
+          </button>
+        </div>
+      )}
+
       {/* Update banner — bottom, non-intrusive */}
       {updateVersion && !updateDismissed && (
         <div className="fixed bottom-0 left-0 right-0 z-40 bg-[#141414] border-t border-[#242424] px-4 py-2.5 flex items-center gap-3">
