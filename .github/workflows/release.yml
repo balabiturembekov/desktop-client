@@ -64,6 +64,17 @@ jobs:
             libgbm-dev
       - name: Install frontend dependencies
         run: pnpm install
+      - name: Debug signing key
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+            Write-Host "Key length: $($env:TAURI_SIGNING_PRIVATE_KEY.Length)"
+          } else {
+            Write-Host "KEY IS EMPTY"
+          }
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
