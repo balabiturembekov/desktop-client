@@ -129,90 +129,100 @@ async fn sync_pending(pool: &SqlitePool) {
         _ => return,
     };
 
+    let mut token = user.access_token.clone();
+
+    // ── Sync pending slots ────────────────────────────────────────────────
+    // Only attempt network sync when there are unsynced slots; orphan cleanup
+    // below always runs regardless so stale rows are never permanently stuck.
     let (entries, slot_ids) = match build_entries(pool).await {
-        Ok(pair) if !pair.1.is_empty() => pair,
-        Ok(_) => return,
+        Ok(pair) => pair,
         Err(e) => {
             log::error!("[sync] failed to fetch slots: {}", e);
             return;
         }
     };
 
-    log::info!("[sync] syncing {} slots", slot_ids.len());
-    let mut token = user.access_token.clone();
+    if !slot_ids.is_empty() {
+        log::info!("[sync] syncing {} slots", slot_ids.len());
 
-    // On 401: refresh token and re-fetch entries.
-    // Re-fetching is safe because ORDER BY id + same LIMIT returns the same rows.
-    // Critically, we also get a fresh slot_ids so indices stay consistent with
-    // the entries we send on retry.
-    let (response, slot_ids) = match sync_time_entries(&client, &token, entries).await {
-        Ok(res) => (res, slot_ids),
-        Err(e) if e.contains("401") => {
-            log::info!("[sync] 401 — refreshing token");
-            match try_refresh(pool).await {
-                Some(new_token) => {
-                    token = new_token;
-                    let (entries2, slot_ids2) = match build_entries(pool).await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            log::error!("[sync] rebuild after 401 failed: {}", e);
-                            return;
-                        }
-                    };
-                    match sync_time_entries(&client, &token, entries2).await {
-                        Ok(res) => (res, slot_ids2),
-                        Err(e) => {
-                            log::error!("[sync] retry failed: {}", e);
-                            return;
+        // On 401: refresh token and re-fetch entries.
+        // Re-fetching is safe because ORDER BY id + same LIMIT returns the same rows.
+        // Critically, we also get a fresh slot_ids so indices stay consistent with
+        // the entries we send on retry.
+        let (response, final_slot_ids) = match sync_time_entries(&client, &token, entries).await {
+            Ok(res) => (res, slot_ids),
+            Err(e) if e.contains("401") => {
+                log::info!("[sync] 401 — refreshing token");
+                match try_refresh(pool).await {
+                    Some(new_token) => {
+                        token = new_token;
+                        let (entries2, slot_ids2) = match build_entries(pool).await {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                log::error!("[sync] rebuild after 401 failed: {}", e);
+                                return;
+                            }
+                        };
+                        match sync_time_entries(&client, &token, entries2).await {
+                            Ok(res) => (res, slot_ids2),
+                            Err(e) => {
+                                log::error!("[sync] retry failed: {}", e);
+                                return;
+                            }
                         }
                     }
+                    None => return,
                 }
-                None => return,
             }
-        }
-        Err(e) => {
-            if !e.contains("404") {
-                sentry::capture_message(&format!("Sync failed: {}", e), sentry::Level::Error);
+            Err(e) => {
+                if !e.contains("404") {
+                    sentry::capture_message(&format!("Sync failed: {}", e), sentry::Level::Error);
+                }
+                log::error!("[sync] failed: {}", e);
+                return;
             }
-            log::error!("[sync] failed: {}", e);
-            return;
-        }
-    };
+        };
 
-    log::info!(
-        "[sync] synced={} failed={}",
-        response.synced,
-        response.failed
-    );
+        log::info!(
+            "[sync] synced={} failed={}",
+            response.synced,
+            response.failed
+        );
 
-    // Mark synced slots, store remote_id, upload screenshots.
-    // response.entries is ordered the same as our request (backend preserves order).
-    for (i, result) in response.entries.iter().enumerate() {
-        if !result.synced || i >= slot_ids.len() {
-            continue;
-        }
-        let slot_id = slot_ids[i];
-        let remote_id = &result.id;
+        // Mark synced slots, store remote_id, upload screenshots.
+        // response.entries is ordered the same as our request (backend preserves order).
+        for (i, result) in response.entries.iter().enumerate() {
+            if !result.synced || i >= final_slot_ids.len() {
+                continue;
+            }
+            let slot_id = final_slot_ids[i];
+            let remote_id = &result.id;
 
-        let _ = sqlx::query(
-            "UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?",
-        )
-        .bind(remote_id)
-        .bind(slot_id)
-        .execute(pool)
-        .await;
-
-        let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
+            let _ = sqlx::query(
+                "UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?",
+            )
+            .bind(remote_id)
             .bind(slot_id)
             .execute(pool)
             .await;
 
-        upload_slot_screenshots(pool, &client, &token, slot_id, remote_id).await;
+            let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
+                .bind(slot_id)
+                .execute(pool)
+                .await;
 
-        log::info!("[sync] slot {} → remote {} ✓", slot_id, remote_id);
+            upload_slot_screenshots(pool, &client, &token, slot_id, remote_id).await;
+
+            log::info!("[sync] slot {} → remote {} ✓", slot_id, remote_id);
+        }
     }
 
-    // Orphan app_usage: rows written to an already-synced slot after sync ran.
+    // ── Orphan cleanup (always runs, even when no new slots were synced) ──
+    // This catches app_usage/screenshots that were written after their slot
+    // was already synced — which previously got stuck forever because this
+    // block was only reachable when slot_ids was non-empty.
+
+    // Orphan app_usage: mark synced so they don't block future sync cycles.
     let orphan = sqlx::query(
         "UPDATE app_usage SET synced = 1 \
          WHERE synced = 0 \
@@ -232,8 +242,8 @@ async fn sync_pending(pool: &SqlitePool) {
         _ => {}
     }
 
-    // Orphan screenshots: upload previously failed screenshots for synced slots.
-    // remote_id is now stored in time_slots so we can retry without re-syncing the entry.
+    // Orphan screenshots: retry upload for screenshots whose slot is already synced.
+    // remote_id is stored in time_slots so we can retry without re-syncing the entry.
     let orphan_screenshots = sqlx::query_as::<_, (i64, String, String, i64)>(
         r#"SELECT s.id, s.file_path, t.remote_id, t.activity_percent
            FROM screenshots s
@@ -338,6 +348,24 @@ async fn cleanup_old_data(pool: &SqlitePool) {
             deleted_files,
             deleted_records
         );
+    }
+
+    // Delete dangling app_usage rows that reference deleted time_slots.
+    // This can happen if cleanup_old_data deleted time_slots rows before the
+    // corresponding app_usage rows were cleaned up (or if they were written after
+    // the slot was already deleted).
+    let dangling = sqlx::query(
+        "DELETE FROM app_usage WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
+    )
+    .execute(pool)
+    .await;
+
+    match dangling {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!("[cleanup] deleted {} dangling app_usage rows", r.rows_affected());
+        }
+        Err(e) => log::warn!("[cleanup] dangling app_usage cleanup failed: {}", e),
+        _ => {}
     }
 
     let result = sqlx::query(

@@ -116,6 +116,14 @@ async fn finalize_slot(
 ) {
     let duration_secs = (ended_at - started_at).num_seconds();
     if duration_secs <= 0 {
+        // Delete zero-duration stub so it doesn't accumulate as an unsynced row.
+        if let Some(sid) = stub_id {
+            let _ = sqlx::query("DELETE FROM time_slots WHERE id = ? AND duration_secs = 0")
+                .bind(sid)
+                .execute(pool)
+                .await;
+            log::info!("[timer] zero-duration stub {} deleted", sid);
+        }
         return;
     }
     if let Some(sid) = stub_id {
