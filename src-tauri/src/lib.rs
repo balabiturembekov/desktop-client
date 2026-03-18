@@ -342,7 +342,10 @@ async fn check_close_requested(app: tauri::AppHandle) {
             },
         );
     } else {
-        // Hide to tray instead of exiting; only "Quit" in tray menu exits fully
+        // Hide to tray instead of exiting; only "Quit" in tray menu exits fully.
+        // UX-13: notify the frontend so it can show a "still running in menu bar"
+        // system notification the first time the window is hidden.
+        let _ = app.emit("hid-to-tray", ());
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.hide();
         }

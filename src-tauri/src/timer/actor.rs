@@ -208,7 +208,7 @@ fn open_idle_window(app: &AppHandle, idle_secs: u64) {
         .inner_size(320.0, 260.0)
         .resizable(false)
         .decorations(false)
-        .always_on_top(true)
+        .always_on_top(false) // UX-14: do not force idle window above all other apps
         .center()
         .build()
     {
