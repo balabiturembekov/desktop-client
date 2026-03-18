@@ -6,6 +6,7 @@ import { User, Project, TimerPayload } from "../types";
 interface Props {
   user: User;
   onLogout: () => void;
+  showUpdateBanner?: boolean; // UX-10: padding when bottom banner is visible
 }
 
 function formatTime(secs: number): string {
@@ -26,7 +27,7 @@ function formatSyncTime(iso: string): string {
   return `${dd}.${mm}.${yyyy} ${hh}:${min}`;
 }
 
-export default function TrackerPage({ user, onLogout }: Props) {
+export default function TrackerPage({ user, onLogout, showUpdateBanner }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [totalSecs, setTotalSecs] = useState(0);
@@ -40,6 +41,8 @@ export default function TrackerPage({ user, onLogout }: Props) {
   // null = unknown (waiting for first connectivity-changed from sync_actor)
   // sync_actor emits the initial state within ~5 s of startup (M-01 audit #3).
   const [isOnline, setIsOnline] = useState<boolean | null>(null);
+  // UX-08: sign-out confirmation dialog
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
 
   // Refs for tray throttle — not state, so they don't trigger re-renders
   const lastTrayUpdate = useRef<number>(0);
@@ -170,6 +173,45 @@ export default function TrackerPage({ user, onLogout }: Props) {
     return () => document.removeEventListener("mousedown", handler);
   }, [showSettings]);
 
+  // UX-21: Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Escape: close logout confirm dialog
+      if (e.key === "Escape") {
+        setShowLogoutConfirm(false);
+        setShowSettings(false);
+        return;
+      }
+
+      const meta = e.metaKey || e.ctrlKey;
+
+      // ⌘R / Ctrl+R: retry loading projects
+      if (meta && e.key.toLowerCase() === "r" && projectsError) {
+        e.preventDefault();
+        setInitialized(false);
+        loadProjects();
+        return;
+      }
+
+      // Space or ⌘Enter / Ctrl+Enter: toggle timer
+      if (e.key === " " || (meta && e.key === "Enter")) {
+        const tag = (e.target as HTMLElement).tagName;
+        if (tag === "BUTTON" || tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA") return;
+        e.preventDefault();
+        if (isRunning) {
+          invoke("stop_worker_timer").catch(console.error);
+        } else if (selectedProject && !starting) {
+          setStarting(true);
+          invoke("start_worker_timer", { projectId: selectedProject.remote_id })
+            .catch(console.error)
+            .finally(() => setStarting(false));
+        }
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [isRunning, selectedProject, starting, projectsError, loadProjects]);
+
   const handleToggleLaunchAtLogin = async () => {
     const next = !launchAtLogin;
     try {
@@ -218,7 +260,8 @@ export default function TrackerPage({ user, onLogout }: Props) {
   }
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#0f0f0f] text-white select-none">
+    // UX-08 overlay needs relative parent; UX-10 pb-12 when update banner visible
+    <div className={`flex flex-col h-screen w-screen bg-[#0f0f0f] text-white select-none relative${showUpdateBanner ? " pb-12" : ""}`}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e1e]">
         <div className="flex items-center gap-2">
@@ -258,13 +301,13 @@ export default function TrackerPage({ user, onLogout }: Props) {
               </div>
             )}
           </div>
-          {/* BUG-F11: aria-label for logout button */}
+          {/* UX-08: "Sign out" text button that opens confirm dialog */}
           <button
-            onClick={handleLogout}
-            aria-label="Logout"
+            onClick={() => setShowLogoutConfirm(true)}
+            aria-label="Sign out"
             className="text-[#555] hover:text-red-400 transition text-xs"
           >
-            ⏏
+            Sign out
           </button>
         </div>
       </div>
@@ -299,6 +342,18 @@ export default function TrackerPage({ user, onLogout }: Props) {
                 Retry
               </button>
             </div>
+          ) : projects.length === 0 ? (
+            /* UX-04: No projects assigned state */
+            <div className="rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] px-3 py-3">
+              <p className="text-xs text-[#888]">No projects assigned.</p>
+              <p className="text-xs text-[#555] mt-0.5">Contact your manager to get access.</p>
+              <button
+                onClick={handleRetry}
+                className="mt-2 text-xs text-[#6ee7b7] hover:text-[#a7f3d0] transition font-semibold"
+              >
+                Retry
+              </button>
+            </div>
           ) : (
             <select
               value={selectedProject?.remote_id ?? ""}
@@ -309,7 +364,6 @@ export default function TrackerPage({ user, onLogout }: Props) {
               disabled={isRunning}
               className="w-full rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] px-3 py-2 text-sm text-white outline-none transition focus:border-[#6ee7b7] disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {projects.length === 0 && <option value="">No projects</option>}
               {projects.map((p) => (
                 <option key={p.remote_id} value={p.remote_id}>{p.name}</option>
               ))}
@@ -335,11 +389,12 @@ export default function TrackerPage({ user, onLogout }: Props) {
               ■ Stop
             </button>
           )}
-          {/* BUG-F11: aria-label for reset button */}
+          {/* UX-17: title="Reset timer" */}
           <button
             onClick={handleReset}
             disabled={isRunning || totalSecs === 0}
             aria-label="Reset timer"
+            title="Reset timer"
             className="rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] px-4 py-2.5 text-sm text-[#555] transition hover:text-white hover:border-[#444] disabled:opacity-30 disabled:cursor-not-allowed"
           >
             ↺
@@ -350,7 +405,11 @@ export default function TrackerPage({ user, onLogout }: Props) {
       {/* Footer */}
       <div className="px-4 py-2 border-t border-[#1e1e1e] flex items-center justify-between">
         {isOnline === null ? (
-          <span className="text-xs text-[#444]">Connecting…</span>
+          /* UX-20: Spinning indicator next to "Connecting..." */
+          <div className="flex items-center gap-1.5">
+            <div className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-[#444] border-t-transparent shrink-0" />
+            <span className="text-xs text-[#444]">Connecting…</span>
+          </div>
         ) : isOnline ? (
           <div className="flex items-center gap-1.5">
             <svg width="10" height="10" viewBox="0 0 10 10" className="shrink-0">
@@ -367,10 +426,43 @@ export default function TrackerPage({ user, onLogout }: Props) {
             <span className="text-xs text-red-500">Offline</span>
           </div>
         )}
+        {/* UX-18: title on truncated project name */}
         {selectedProject && (
-          <span className="text-xs text-[#444] truncate max-w-[150px]">{selectedProject.name}</span>
+          <span
+            title={selectedProject.name}
+            className="text-xs text-[#444] truncate max-w-[150px]"
+          >
+            {selectedProject.name}
+          </span>
         )}
       </div>
+
+      {/* UX-08: Sign out confirmation overlay */}
+      {showLogoutConfirm && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70">
+          <div className="w-[260px] rounded-xl bg-[#141414] border border-[#242424] shadow-2xl p-5 flex flex-col gap-4">
+            <div>
+              <p className="text-sm font-semibold text-white">Sign out?</p>
+              <p className="text-xs text-[#555] mt-1">Your local data will be cleared.</p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <button
+                autoFocus
+                onClick={handleLogout}
+                className="w-full rounded-lg bg-red-500 py-2 text-xs font-semibold text-white transition hover:bg-red-400"
+              >
+                Sign out
+              </button>
+              <button
+                onClick={() => setShowLogoutConfirm(false)}
+                className="w-full rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] py-2 text-xs text-[#888] transition hover:border-[#444] hover:text-white"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

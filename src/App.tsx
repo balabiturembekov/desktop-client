@@ -146,6 +146,33 @@ export default function App() {
     return () => { cancelled = true; unlisten?.(); };
   }, []);
 
+  // UX-13: Show "Hubnity is still running in your menu bar" notification on first hide-to-tray.
+  // Stored in localStorage so it only fires once per device.
+  useEffect(() => {
+    if (localStorage.getItem("tray-notice-shown") === "1") return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen("hid-to-tray", async () => {
+      if (localStorage.getItem("tray-notice-shown") === "1") return;
+      localStorage.setItem("tray-notice-shown", "1");
+      let permissionGranted = await isPermissionGranted();
+      if (!permissionGranted) {
+        const permission = await requestPermission();
+        permissionGranted = permission === "granted";
+      }
+      if (permissionGranted) {
+        sendNotification({
+          title: "Hubnity",
+          body: "Hubnity is still running in your menu bar.",
+        });
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
   // BUG-F10: catch and display update errors
   const handleUpdate = async () => {
     setUpdating(true);
@@ -173,6 +200,17 @@ export default function App() {
     await invoke("cmd_force_quit").catch(console.error);
   };
 
+  // UX-21: Escape closes modals in App
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (closeModal) setCloseModal(null);
+      if (permissionsRequired) setPermissionsRequired(false);
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [closeModal, permissionsRequired]);
+
   if (checking) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-[#0f0f0f]">
@@ -186,48 +224,51 @@ export default function App() {
       ? Math.round((updateProgress.downloaded / updateProgress.total) * 100)
       : null;
 
+  const showUpdateBanner = !!(updateVersion && !updateDismissed);
+
   return (
     <>
-      {/* Accessibility needs-restart banner */}
-      {accessibilityNeedsRestart && (
-        <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e1208] border-b border-[#4a2e0a] px-4 py-2.5 flex items-center gap-3">
-          <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
-            <path d="M8 2L14 13H2L8 2Z" stroke="#f59e0b" strokeWidth="1.5" strokeLinejoin="round"/>
-            <path d="M8 7v3M8 11.5v.5" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
-          </svg>
-          <p className="flex-1 text-xs text-[#f59e0b]">
-            Permission granted — quit and reopen Hubnity to apply
-          </p>
-          <button
-            onClick={() => invoke("cmd_force_quit").catch(() => {})}
-            className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
-          >
-            Quit & Reopen
-          </button>
-        </div>
-      )}
-
-      {/* Listener-died banner — activity tracking stopped unexpectedly */}
-      {listenerDied && (
-        <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e0808] border-b border-[#4a0a0a] px-4 py-2.5 flex items-center gap-3">
-          <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
-            <path d="M8 2L14 13H2L8 2Z" stroke="#f87171" strokeWidth="1.5" strokeLinejoin="round"/>
-            <path d="M8 7v3M8 11.5v.5" stroke="#f87171" strokeWidth="1.5" strokeLinecap="round"/>
-          </svg>
-          <p className="flex-1 text-xs text-red-400">
-            Activity tracking stopped unexpectedly. Please restart the app.
-          </p>
-          <button
-            onClick={() => invoke("cmd_force_quit").catch(() => {})}
-            className="shrink-0 rounded-md bg-red-500 px-3 py-1 text-[11px] font-semibold text-white transition hover:bg-red-400"
-          >
-            Quit &amp; Reopen
-          </button>
-        </div>
+      {/* UX-09: Only show ONE top banner; listenerDied takes priority over accessibilityNeedsRestart */}
+      {(listenerDied || accessibilityNeedsRestart) && (
+        listenerDied ? (
+          <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e0808] border-b border-[#4a0a0a] px-4 py-2.5 flex items-center gap-3">
+            <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M8 2L14 13H2L8 2Z" stroke="#f87171" strokeWidth="1.5" strokeLinejoin="round"/>
+              <path d="M8 7v3M8 11.5v.5" stroke="#f87171" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="flex-1 text-xs text-red-400">
+              Activity tracking stopped unexpectedly. Please restart the app.
+            </p>
+            {/* UX-02: "Quit App" instead of "Quit & Reopen" */}
+            <button
+              onClick={() => invoke("cmd_force_quit").catch(() => {})}
+              className="shrink-0 rounded-md bg-red-500 px-3 py-1 text-[11px] font-semibold text-white transition hover:bg-red-400"
+            >
+              Quit App
+            </button>
+          </div>
+        ) : (
+          <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e1208] border-b border-[#4a2e0a] px-4 py-2.5 flex items-center gap-3">
+            <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
+              <path d="M8 2L14 13H2L8 2Z" stroke="#f59e0b" strokeWidth="1.5" strokeLinejoin="round"/>
+              <path d="M8 7v3M8 11.5v.5" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round"/>
+            </svg>
+            <p className="flex-1 text-xs text-[#f59e0b]">
+              Permission granted — quit and reopen Hubnity to apply
+            </p>
+            {/* UX-02: "Quit App" instead of "Quit & Reopen" */}
+            <button
+              onClick={() => invoke("cmd_force_quit").catch(() => {})}
+              className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
+            >
+              Quit App
+            </button>
+          </div>
+        )
       )}
 
       {/* Update banner — bottom, non-intrusive */}
-      {updateVersion && !updateDismissed && (
+      {showUpdateBanner && (
         <div className="fixed bottom-0 left-0 right-0 z-40 bg-[#141414] border-t border-[#242424] px-4 py-2.5 flex items-center gap-3">
           {updating ? (
             <>
@@ -244,6 +285,8 @@ export default function App() {
                     ? `Downloading… ${progressPercent}%`
                     : "Downloading…"}
                 </p>
+                {/* UX-11: "App will restart automatically" */}
+                <p className="text-[10px] text-[#444] mt-0.5">App will restart automatically</p>
               </div>
             </>
           ) : updateError ? (
@@ -291,25 +334,36 @@ export default function App() {
       )}
 
       {user ? (
-        <TrackerPage user={user} onLogout={() => setUser(null)} />
+        /* UX-10: pass showUpdateBanner so TrackerPage can add bottom padding */
+        <TrackerPage user={user} onLogout={() => setUser(null)} showUpdateBanner={showUpdateBanner} />
       ) : (
         <LoginPage onLogin={setUser} />
       )}
 
-      {/* Permissions onboarding screen */}
-      {permissionsRequired && (
+      {/* UX-01: Permissions onboarding screen — only after login */}
+      {permissionsRequired && user && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0f0f0f]">
           <div className="w-[340px] rounded-xl bg-[#141414] border border-[#242424] shadow-2xl p-6 flex flex-col gap-5">
             {/* Header */}
             <div className="flex flex-col gap-1">
-              <div className="flex items-center gap-2">
-                <div className="h-5 w-5 rounded bg-[#f59e0b] flex items-center justify-center shrink-0">
-                  <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
-                    <path d="M8 2L14 13H2L8 2Z" stroke="#0f0f0f" strokeWidth="1.5" strokeLinejoin="round"/>
-                    <path d="M8 7v3M8 11.5v.5" stroke="#0f0f0f" strokeWidth="1.5" strokeLinecap="round"/>
-                  </svg>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="h-5 w-5 rounded bg-[#f59e0b] flex items-center justify-center shrink-0">
+                    <svg width="10" height="10" viewBox="0 0 16 16" fill="none">
+                      <path d="M8 2L14 13H2L8 2Z" stroke="#0f0f0f" strokeWidth="1.5" strokeLinejoin="round"/>
+                      <path d="M8 7v3M8 11.5v.5" stroke="#0f0f0f" strokeWidth="1.5" strokeLinecap="round"/>
+                    </svg>
+                  </div>
+                  <span className="text-sm font-semibold text-white">Permissions Required</span>
                 </div>
-                <span className="text-sm font-semibold text-white">Permissions Required</span>
+                {/* UX-01: "Skip for now" × button */}
+                <button
+                  onClick={() => setPermissionsRequired(false)}
+                  aria-label="Skip for now"
+                  className="text-[#555] hover:text-white transition text-base leading-none"
+                >
+                  ×
+                </button>
               </div>
               <p className="text-xs text-[#666] ml-7">
                 Grant the following permissions, then restart the app.
@@ -358,11 +412,12 @@ export default function App() {
               >
                 Open Settings
               </button>
+              {/* UX-02: "Quit App" instead of "Quit & Reopen" */}
               <button
                 onClick={() => invoke("cmd_force_quit").catch(console.error)}
                 className="w-full rounded-lg bg-[#6ee7b7] py-2 text-xs font-semibold text-[#0f0f0f] transition hover:bg-[#a7f3d0]"
               >
-                Quit &amp; Reopen
+                Quit App
               </button>
             </div>
           </div>
@@ -407,7 +462,7 @@ export default function App() {
               )}
             </div>
 
-            {/* Buttons — BUG-F16: autoFocus on primary action */}
+            {/* UX-07: "Go back" in ALL variants */}
             <div className="flex flex-col gap-2">
               {closeModal.timer_running && (
                 <button
@@ -426,13 +481,21 @@ export default function App() {
                   )}
                 </button>
               )}
-              {/* BUG-F06: renamed from "Wait for sync" to "Go back" */}
-              {!closeModal.timer_running && closeModal.unsynced_count > 0 && (
+              {/* Go back — primary when timer is not running, secondary when it is */}
+              {!closeModal.timer_running && closeModal.unsynced_count > 0 ? (
                 <button
                   autoFocus
                   onClick={handleGoBack}
                   disabled={closing}
                   className="w-full rounded-lg bg-[#6ee7b7] py-2 text-xs font-semibold text-[#0f0f0f] transition hover:bg-[#a7f3d0] disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Go back
+                </button>
+              ) : (
+                <button
+                  onClick={handleGoBack}
+                  disabled={closing}
+                  className="w-full rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] py-2 text-xs text-[#888] transition hover:border-[#444] hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Go back
                 </button>
