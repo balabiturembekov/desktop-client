@@ -21,3 +21,7 @@ export interface TimerPayload {
   is_running: boolean;
   project_id?: string;
 }
+
+export interface IdleUpdatePayload {
+  idle_secs: number;
+}

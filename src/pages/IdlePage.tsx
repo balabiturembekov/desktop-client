@@ -1,16 +1,48 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { IdleUpdatePayload } from "../types";
+
+function formatIdleTime(secs: number): string {
+  if (secs < 3600) {
+    return `${Math.max(1, Math.floor(secs / 60))} min`;
+  } else if (secs < 86400) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return m > 0 ? `${h} h ${m} min` : `${h} h`;
+  } else {
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    return h > 0 ? `${d} days ${h} h` : `${d} days`;
+  }
+}
 
 export default function IdlePage() {
   const params = new URLSearchParams(window.location.search);
-  // BUG-F09: validate idleMins — parseInt may return NaN, clamp to minimum 1
-  const idleMins = String(Math.max(1, parseInt(params.get("idle_mins") ?? "5") || 5));
+  const initialIdleSecs = Math.max(0, parseInt(params.get("idle_secs") ?? "0") || 0);
 
+  const [idleSecs, setIdleSecs] = useState(initialIdleSecs);
   const [resuming, setResuming] = useState(false);
   const [stopping, setStopping] = useState(false);
 
-  // BUG-F04: try-catch + loading state on both buttons
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    listen<IdleUpdatePayload>("timer-idle-update", (event) => {
+      setIdleSecs(event.payload.idle_secs);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const handleResume = async () => {
     if (resuming || stopping) return;
     setResuming(true);
@@ -53,13 +85,14 @@ export default function IdlePage() {
         <div className="text-center">
           <h2 className="text-white font-semibold text-base">You've been idle</h2>
           <p className="text-[#555] text-sm mt-1">
-            No activity for {idleMins} min.<br />
+            No activity for {formatIdleTime(idleSecs)}.<br />
             What would you like to do?
           </p>
         </div>
 
         <div className="flex flex-col gap-2 w-full">
           <button
+            autoFocus
             onClick={handleResume}
             disabled={resuming || stopping}
             style={{ cursor: "default" }}

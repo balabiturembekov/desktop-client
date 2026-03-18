@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
+use tokio::time::MissedTickBehavior;
 
 use crate::app_tracker::models::AppKey;
 
@@ -35,6 +36,7 @@ pub async fn app_tracker_actor(
     // Counts consecutive get_active_window failures to suppress log spam.
     let mut consecutive_errors: u64 = 0;
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_SECS));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         interval.tick().await;

@@ -294,10 +294,12 @@ pub async fn cmd_stop_after_idle(
         .map_err(|e| e.to_string())
 }
 
-/// Stops the timer (idempotent) and clears all user/project rows so the
-/// frontend can return to the login screen with a clean slate.
+/// Stops the timer (idempotent), disables autostart, deletes all user data
+/// (time_slots, app_usage, screenshots, projects, users) and removes screenshot
+/// files from disk so the frontend returns to a clean login screen.
 #[tauri::command]
 pub async fn cmd_logout(
+    app: tauri::AppHandle,
     state: State<'_, TimerState>,
     pool: State<'_, SqlitePool>,
 ) -> Result<(), String> {
@@ -305,7 +307,31 @@ pub async fn cmd_logout(
     let _ = state.sender.send(TimerCommand::Stop).await;
     // Give the actor time to finalize the current chunk before clearing the DB.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    sqlx::query("DELETE FROM users")
+
+    // Disable autostart so the app doesn't relaunch automatically after logout
+    // (L-01 from audit #3).
+    if let Err(e) = app.autolaunch().disable() {
+        log::warn!("[logout] failed to disable autostart: {}", e);
+    }
+
+    // Collect screenshot file paths before deleting DB rows (M-04 from audit #3).
+    // Deleting the DB rows first would make orphaned files invisible to the
+    // sync/cleanup pipeline forever.
+    let screenshot_paths = sqlx::query_as::<_, (String,)>("SELECT file_path FROM screenshots")
+        .fetch_all(&*pool)
+        .await
+        .unwrap_or_default();
+
+    // Delete in foreign-key order: children before parents.
+    sqlx::query("DELETE FROM screenshots")
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM app_usage")
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM time_slots")
         .execute(&*pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -313,6 +339,20 @@ pub async fn cmd_logout(
         .execute(&*pool)
         .await
         .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM users")
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Remove screenshot files from disk after DB rows are gone.
+    for (path,) in screenshot_paths {
+        match tokio::fs::remove_file(&path).await {
+            Ok(_) => log::info!("[logout] deleted screenshot file: {}", path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("[logout] failed to delete screenshot {}: {}", path, e),
+        }
+    }
+
     Ok(())
 }
 

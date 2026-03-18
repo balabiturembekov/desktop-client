@@ -8,7 +8,7 @@ use tauri::WebviewWindowBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::timer::models::TimerCommand;
 use crate::tracker::models::ActivityState;
@@ -20,7 +20,15 @@ const PROGRESS_SAVE_EVERY_SECS: i64 = 60; // обновлять stub кажду�
 /// tokio::time::interval uses a monotonic clock (advances during sleep on macOS),
 /// so on wake the tick fires immediately — but Utc::now() also advanced.
 /// Comparing wall-clock elapsed since the last tick lets us detect suspend cycles.
-const SLEEP_DETECT_SECS: i64 = 60;
+/// Lowered from 60 → 10 so that brief suspend/resume cycles (lid close then
+/// open within a minute) are also detected instead of silently counting as
+/// active time.
+// Lowered from 60 → 10 in audit #2 for brief suspend cycles; raised back to 30
+// to reduce false positives from large NTP clock adjustments (which can jump
+// up to ~15 s on some networks). 30 s is a safe compromise: any real sleep
+// cycle is detectable within half a minute, while NTP jitter stays below the
+// threshold (BUG-H05 from audit #3).
+const SLEEP_DETECT_SECS: i64 = 30;
 
 /// Возвращает ключ текущего дня как (year, ordinal).
 /// Использование пары year+ordinal вместо одного ordinal корректно
@@ -189,8 +197,7 @@ async fn update_slot(
 }
 
 fn open_idle_window(app: &AppHandle, idle_secs: u64) {
-    let idle_mins = idle_secs / 60;
-    let url = format!("/idle?idle_mins={}", idle_mins);
+    let url = format!("/idle?idle_secs={}", idle_secs);
 
     if let Some(w) = app.get_webview_window("idle") {
         let _ = w.close();
@@ -233,7 +240,11 @@ pub async fn time_actor(
     let mut stub_slot_id: Option<i64> = None; // ID текущего stub-слота (обновляется in-place)
     let mut last_progress_save: i64 = 0; // chunk_elapsed_secs на момент последнего прогресс-сейва
     let mut idle_window_opened = false;
+    // Wall-clock time of last activity when the idle window was opened.
+    // Used to recompute the total idle duration (including sleep) on wake.
+    let mut idle_last_active_at: Option<DateTime<Utc>> = None;
     let mut tick = interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Wall-clock time of the previous tick — used to detect system sleep/wake.
     // Updated at Start (reset) and on every tick.
     let mut last_tick_at: DateTime<Utc> = Utc::now();
@@ -266,6 +277,7 @@ pub async fn time_actor(
                             current_day = day_key(&Local::now());
                             running = true;
                             idle_window_opened = false;
+                            idle_last_active_at = None;
                             is_running_flag.store(true, Ordering::Relaxed);
                             let start_time = Utc::now();
                             chunk_started_at = Some(start_time);
@@ -288,6 +300,8 @@ pub async fn time_actor(
                             }
 
                             current_project_id = Some(project_id);
+                            // Signal listener to switch to high-frequency (100 ms) polling.
+                            activity.timer_active.store(true, Ordering::Relaxed);
                             tick.reset();
                             // Reset last_tick_at so the first post-start tick doesn't
                             // misidentify the idle period before Start as a sleep gap.
@@ -300,9 +314,16 @@ pub async fn time_actor(
                         }
                     }
                     Some(TimerCommand::Stop) => {
+                        // Always clear idle state regardless of the running flag.
+                        // cmd_stop_after_idle sends Stop when running=false (idle window
+                        // already open), so we must reset outside the guard to stop the
+                        // tick from firing forever (BUG-H01 from audit #3).
+                        idle_window_opened = false;
+                        idle_last_active_at = None;
                         if running {
                             running = false;
                             is_running_flag.store(false, Ordering::Relaxed);
+                            activity.timer_active.store(false, Ordering::Relaxed);
                             // Ensure idle window is gone and main is re-enabled
                             // (covers tray "Stop" while idle dialog is showing).
                             if let Some(idle) = app.get_webview_window("idle") {
@@ -339,8 +360,13 @@ pub async fn time_actor(
                         }
                     }
                     Some(TimerCommand::Reset) => {
+                        // Clear idle state unconditionally so the tick stops firing
+                        // if Reset is called while the idle window is open (BUG-H02).
+                        idle_window_opened = false;
+                        idle_last_active_at = None;
                         running = false;
                         is_running_flag.store(false, Ordering::Relaxed);
+                        activity.timer_active.store(false, Ordering::Relaxed);
 
                         // Clear current_slot_id BEFORE deleting the stub row.
                         // app_tracker_actor reads current_slot_id every 5s; if we delete
@@ -377,20 +403,37 @@ pub async fn time_actor(
                     None => break,
                 }
             }
-            _ = tick.tick(), if running => {
+            // Tick fires when running OR when idle window is open (to detect
+            // sleep/wake while the user is looking at the idle dialog).
+            _ = tick.tick(), if running || idle_window_opened => {
                 // ── Sleep/wake detection ──────────────────────────────────────
                 // Compute wall-clock time since the previous tick. On macOS,
                 // tokio's monotonic interval advances during system sleep, so the
                 // interval fires immediately on wake — but Utc::now() shows the
                 // full wall-clock gap including sleep time. A gap > SLEEP_DETECT_SECS
-                // means the machine was suspended; finalize the chunk up to the
-                // pre-sleep moment and stop the timer so the idle dialog appears.
+                // means the machine was suspended.
                 let now_utc = Utc::now();
                 let real_elapsed = (now_utc - last_tick_at).num_seconds();
                 let prev_tick_at = last_tick_at;
                 last_tick_at = now_utc;
 
                 if real_elapsed > SLEEP_DETECT_SECS {
+                    if !running && idle_window_opened {
+                        // Machine slept while the idle window was already open.
+                        // Recompute total idle time from the original last-activity
+                        // moment (includes both pre-sleep idle + sleep duration).
+                        let new_idle_secs = idle_last_active_at
+                            .map(|t| (now_utc - t).num_seconds().max(0) as u64)
+                            .unwrap_or(real_elapsed as u64);
+                        log::info!(
+                            "[timer] sleep/wake with idle window open: updating idle_secs={}",
+                            new_idle_secs
+                        );
+                        let _ = app.emit("timer-idle-update", IdlePayload { idle_secs: new_idle_secs });
+                        continue;
+                    }
+
+                    // Timer was running when the machine went to sleep.
                     log::warn!(
                         "[timer] sleep/wake detected: {}s gap — finalizing chunk at pre-sleep time",
                         real_elapsed
@@ -398,6 +441,11 @@ pub async fn time_actor(
                     running = false;
                     idle_window_opened = true;
                     is_running_flag.store(false, Ordering::Relaxed);
+                    // Signal activity_actor to skip its next tick (the one that fires
+                    // immediately on wake). Must be set before resetting counters so
+                    // activity_actor's SeqCst swap sees it before our Relaxed stores.
+                    activity.is_waking.store(true, Ordering::SeqCst);
+                    activity.timer_active.store(false, Ordering::Relaxed);
 
                     let started_at_opt = chunk_started_at.take();
                     let sid = stub_slot_id.take();
@@ -408,6 +456,11 @@ pub async fn time_actor(
                             .await;
                     }
 
+                    // Record where idle started so subsequent sleeps can compute
+                    // the total idle duration correctly. Use the last known activity
+                    // timestamp if available — more accurate than prev_tick_at when
+                    // the user was already idle before closing the lid (BUG-H03).
+                    idle_last_active_at = Some(last_activity_at.unwrap_or(prev_tick_at));
                     current_project_id = None;
                     last_activity_at = None;
                     last_seen_activity_ts = 0;
@@ -425,6 +478,11 @@ pub async fn time_actor(
                     });
 
                     open_idle_window(&app, real_elapsed as u64);
+                    continue;
+                }
+
+                // Idle window is open but no sleep detected — nothing else to do.
+                if !running {
                     continue;
                 }
 
@@ -483,7 +541,12 @@ pub async fn time_actor(
                 let activity_ts = activity.last_activity_secs.load(Ordering::Relaxed);
                 if activity_ts > last_seen_activity_ts {
                     last_seen_activity_ts = activity_ts;
-                    last_activity_at = Some(Utc::now());
+                    // Use the actual event timestamp stored by the listener rather than
+                    // Utc::now() (which is the processing time, up to 1s later).
+                    // Utc.timestamp_opt is the non-deprecated chrono API.
+                    last_activity_at = Utc.timestamp_opt(activity_ts as i64, 0)
+                        .single()
+                        .or(Some(Utc::now()));
                 }
 
                 if let Some(last_active) = last_activity_at {
@@ -497,6 +560,7 @@ pub async fn time_actor(
                         running = false;
                         idle_window_opened = true;
                         is_running_flag.store(false, Ordering::Relaxed);
+                        activity.timer_active.store(false, Ordering::Relaxed);
 
                         // Финализируем stub до момента последней активности.
                         // finalize_slot handles the fallback if stub creation had failed.
@@ -508,6 +572,9 @@ pub async fn time_actor(
                             finalize_slot(&pool, project_id, sid, started_at, last_active, &activity).await;
                         }
 
+                        // Record where idle started so that if the machine subsequently
+                        // sleeps, we can compute the total idle duration on wake.
+                        idle_last_active_at = Some(last_active);
                         current_project_id = None;
                         last_activity_at = None;
                         last_seen_activity_ts = 0;
@@ -518,7 +585,6 @@ pub async fn time_actor(
                         *current_slot_id.lock().await = None;
 
                         today_secs_cache = get_today_secs(&pool).await;
-                        let _ = app.emit("timer-idle", IdlePayload { idle_secs: idle_secs as u64 });
                         let _ = app.emit("timer-tick", TimerPayload {
                             total_secs: today_secs_cache as u64,
                             is_running: false,

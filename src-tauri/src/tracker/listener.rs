@@ -126,7 +126,15 @@ pub fn start_listener(state: ActivityState, app: AppHandle) {
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(100));
+            // Throttle polling frequency when the timer is not running.
+            // 100 ms while active (high responsiveness for idle detection);
+            // 1 000 ms when idle/stopped (reduces constant Accessibility API load).
+            let poll_ms = if state.timer_active.load(Ordering::Relaxed) {
+                100
+            } else {
+                1_000
+            };
+            std::thread::sleep(Duration::from_millis(poll_ms));
         }
     }
 }

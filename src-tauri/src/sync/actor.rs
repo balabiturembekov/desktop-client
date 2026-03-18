@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::api::auth::refresh_token;
 use crate::api::sync::{sync_time_entries, upload_screenshot, SyncAppUsage, SyncTimeEntry};
@@ -18,6 +18,11 @@ pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
         .build()
         .expect("failed to build HTTP client");
 
+    // Emit initial connectivity state immediately so the UI doesn't show a
+    // false "online" indicator for the first 30 s (M-01 from audit #3).
+    let initial_online = is_online(&client).await;
+    let _ = app.emit("connectivity-changed", initial_online);
+
     // Run sync and cleanup as independent loops so a slow sync cycle never
     // delays the hourly cleanup (and vice-versa).
     let pool_sync = pool.clone();
@@ -25,9 +30,10 @@ pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
     let app_sync = app.clone();
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(30));
-        // Track last known online state so connectivity-changed is only emitted
-        // when the state actually changes, not on every tick.
-        let mut was_online = true;
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Initialise from the startup ping so the first sync tick doesn't
+        // immediately re-emit connectivity-changed with the same value.
+        let mut was_online = initial_online;
         loop {
             tick.tick().await;
             sync_pending(&pool_sync, &client_sync, &app_sync, &mut was_online).await;
@@ -35,6 +41,7 @@ pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
     });
 
     let mut cleanup_tick = interval(Duration::from_secs(3600));
+    cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         cleanup_tick.tick().await;
         cleanup_old_data(&pool).await;

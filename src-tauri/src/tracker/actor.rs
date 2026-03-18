@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::tracker::models::ActivityState;
 
@@ -22,17 +22,30 @@ pub struct ActivityPayload {
 ///
 /// Does NOT persist to DB — timer_actor owns all DB writes via update_slot / save_chunk
 /// and resets the counters at every chunk boundary.
+///
+/// MissedTickBehavior::Skip: prevents the post-sleep burst of backlogged 1-second
+/// ticks from inflating total_seconds. Combined with the is_waking guard below,
+/// this eliminates the race between time_actor's counter reset and this actor's
+/// fetch_add calls.
 pub async fn activity_actor(
     state: ActivityState,
     app: AppHandle,
     timer_running: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut tick = interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tick.tick().await;
 
         if !timer_running.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        // is_waking is set by time_actor immediately after sleep/wake detection,
+        // before it resets active_seconds / total_seconds to 0. Skipping here
+        // ensures we don't increment counters in the same tick time_actor zeroes them.
+        if state.is_waking.swap(false, Ordering::SeqCst) {
             continue;
         }
 

@@ -73,6 +73,7 @@ pub fn run() {
             let update_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(4 * 3600));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tick.tick().await; // первый тик — немедленно
                     check_for_updates(update_handle.clone()).await;
@@ -109,10 +110,32 @@ pub fn run() {
 
             let listener_state = activity_state.clone();
             let listener_handle = handle.clone();
-            std::thread::Builder::new()
+            let listener_join = std::thread::Builder::new()
                 .name("activity-listener".to_string())
                 .spawn(move || start_listener(listener_state, listener_handle))
                 .expect("failed to spawn activity listener thread");
+
+            // Watchdog: checks every 60s that the listener thread is still alive.
+            // If it has exited unexpectedly, logs an error and emits "permissions-required"
+            // so the frontend can guide the user to re-grant Accessibility permission.
+            let watchdog_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick.tick().await; // skip the immediate first tick
+                loop {
+                    tick.tick().await;
+                    if listener_join.is_finished() {
+                        log::error!("[tracker] activity-listener thread has exited unexpectedly");
+                        // Use a dedicated event so the frontend can show a targeted
+                        // message instead of the generic permissions screen (H-04 / L-03
+                        // from audit #3). Break immediately — is_finished() stays true
+                        // forever, so looping would spam the event every 60 s (BUG-G02).
+                        let _ = watchdog_handle.emit("listener-died", ());
+                        break;
+                    }
+                }
+            });
 
             tauri::async_runtime::spawn(activity_actor(
                 activity_state,

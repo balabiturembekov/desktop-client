@@ -33,6 +33,7 @@ export default function App() {
   const [closing, setClosing] = useState(false);
   const [permissionsRequired, setPermissionsRequired] = useState(false);
   const [accessibilityNeedsRestart, setAccessibilityNeedsRestart] = useState(false);
+  const [listenerDied, setListenerDied] = useState(false);
 
   useEffect(() => {
     invoke<User | null>("cmd_get_current_user")
@@ -111,6 +112,21 @@ export default function App() {
     };
   }, []);
 
+  // H-04 (audit #3): listener-died fires once when the activity-listener thread
+  // exits unexpectedly. Watchdog breaks after the first emit so this fires at
+  // most once per app session.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen("listener-died", () => {
+      setListenerDied(true);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -187,6 +203,25 @@ export default function App() {
             className="shrink-0 rounded-md bg-[#f59e0b] px-3 py-1 text-[11px] font-semibold text-[#0f0f0f] transition hover:bg-[#fbbf24]"
           >
             Quit & Reopen
+          </button>
+        </div>
+      )}
+
+      {/* Listener-died banner — activity tracking stopped unexpectedly */}
+      {listenerDied && (
+        <div className="fixed top-0 left-0 right-0 z-50 bg-[#1e0808] border-b border-[#4a0a0a] px-4 py-2.5 flex items-center gap-3">
+          <svg className="shrink-0" width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path d="M8 2L14 13H2L8 2Z" stroke="#f87171" strokeWidth="1.5" strokeLinejoin="round"/>
+            <path d="M8 7v3M8 11.5v.5" stroke="#f87171" strokeWidth="1.5" strokeLinecap="round"/>
+          </svg>
+          <p className="flex-1 text-xs text-red-400">
+            Activity tracking stopped unexpectedly. Please restart the app.
+          </p>
+          <button
+            onClick={() => invoke("cmd_force_quit").catch(() => {})}
+            className="shrink-0 rounded-md bg-red-500 px-3 py-1 text-[11px] font-semibold text-white transition hover:bg-red-400"
+          >
+            Quit &amp; Reopen
           </button>
         </div>
       )}

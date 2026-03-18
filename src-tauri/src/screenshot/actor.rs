@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::screenshot::capture::capture_screenshot;
 
@@ -148,6 +148,7 @@ pub async fn screenshot_actor(
     current_slot_id: Arc<Mutex<Option<i64>>>,
 ) {
     let mut tick = interval(Duration::from_secs(POLL_SECS));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Elapsed seconds since the start of the current chunk.
     let mut chunk_elapsed: u64 = 0;

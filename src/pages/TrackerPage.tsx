@@ -37,7 +37,9 @@ export default function TrackerPage({ user, onLogout }: Props) {
   const [showSettings, setShowSettings] = useState(false);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
-  const [isOnline, setIsOnline] = useState(true);
+  // null = unknown (waiting for first connectivity-changed from sync_actor)
+  // sync_actor emits the initial state within ~5 s of startup (M-01 audit #3).
+  const [isOnline, setIsOnline] = useState<boolean | null>(null);
 
   // Refs for tray throttle — not state, so they don't trigger re-renders
   const lastTrayUpdate = useRef<number>(0);
@@ -347,7 +349,9 @@ export default function TrackerPage({ user, onLogout }: Props) {
 
       {/* Footer */}
       <div className="px-4 py-2 border-t border-[#1e1e1e] flex items-center justify-between">
-        {isOnline ? (
+        {isOnline === null ? (
+          <span className="text-xs text-[#444]">Connecting…</span>
+        ) : isOnline ? (
           <div className="flex items-center gap-1.5">
             <svg width="10" height="10" viewBox="0 0 10 10" className="shrink-0">
               <circle cx="5" cy="5" r="4.5" fill="none" stroke="#6ee7b7" strokeWidth="1"/>
