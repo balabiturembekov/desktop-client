@@ -23,5 +23,19 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool, sqlx::Error> {
 
     sqlx::migrate!("./src/db/migrations").run(&pool).await?;
 
+    // WAL mode: concurrent readers don't block the writer (and vice-versa),
+    // which is critical because 5 actors write to the DB simultaneously.
+    sqlx::query("PRAGMA journal_mode = WAL;")
+        .execute(&pool)
+        .await?;
+    // NORMAL durability is safe with WAL and avoids an fsync on every commit.
+    sqlx::query("PRAGMA synchronous = NORMAL;")
+        .execute(&pool)
+        .await?;
+    // Enforce FK constraints declared in the schema (OFF by default in SQLite).
+    sqlx::query("PRAGMA foreign_keys = ON;")
+        .execute(&pool)
+        .await?;
+
     Ok(pool)
 }

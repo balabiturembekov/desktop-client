@@ -20,7 +20,7 @@ const RETRY_SECS: u64 = 30;
 /// - No panic → no unwanted Sentry report (`handled: false`)
 /// - Clean retry every RETRY_SECS without spamming the panic hook
 #[cfg(target_os = "macos")]
-fn is_accessibility_trusted() -> bool {
+pub fn is_accessibility_trusted() -> bool {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXIsProcessTrusted() -> bool;
@@ -29,7 +29,7 @@ fn is_accessibility_trusted() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_accessibility_trusted() -> bool {
+pub fn is_accessibility_trusted() -> bool {
     true
 }
 
@@ -42,7 +42,7 @@ pub fn start_listener(state: ActivityState, app: AppHandle) {
                 "[tracker] Accessibility permission not granted — retrying in {}s",
                 RETRY_SECS
             );
-            let _ = app.emit("accessibility-denied", ());
+            let _ = app.emit("permissions-required", ());
             std::thread::sleep(Duration::from_secs(RETRY_SECS));
             continue;
         }
@@ -103,8 +103,13 @@ pub fn start_listener(state: ActivityState, app: AppHandle) {
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        state.activity_flag.store(true, Ordering::Relaxed);
-                        state.last_activity_secs.store(now_secs, Ordering::Relaxed);
+                        // Guard against clock-before-epoch (now_secs == 0): storing 0
+                        // would silently disable idle detection until real activity fires
+                        // a non-zero timestamp again (BUG-A10).
+                        if now_secs > 0 {
+                            state.activity_flag.store(true, Ordering::Relaxed);
+                            state.last_activity_secs.store(now_secs, Ordering::Relaxed);
+                        }
                     }
 
                     last_mouse_pos = mouse.coords;
@@ -115,7 +120,7 @@ pub fn start_listener(state: ActivityState, app: AppHandle) {
                         "[tracker] poll panicked (accessibility revoked?) — restarting in {}s",
                         RETRY_SECS
                     );
-                    let _ = app.emit("accessibility-denied", ());
+                    let _ = app.emit("permissions-required", ());
                     std::thread::sleep(Duration::from_secs(RETRY_SECS));
                     break; // break inner loop → outer loop re-checks permission
                 }

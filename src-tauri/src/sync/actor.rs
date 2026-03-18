@@ -1,4 +1,6 @@
+use chrono::Utc;
 use sqlx::SqlitePool;
+use tauri::{AppHandle, Emitter};
 use tokio::time::{interval, Duration};
 
 use crate::api::auth::refresh_token;
@@ -8,19 +10,34 @@ use crate::db::models::user::User;
 /// Max slots to sync per cycle — prevents loading thousands of rows into memory.
 const SYNC_BATCH_LIMIT: i64 = 50;
 
-pub async fn sync_actor(pool: SqlitePool) {
-    let mut sync_tick = interval(Duration::from_secs(30));
-    let mut cleanup_tick = interval(Duration::from_secs(3600));
+pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
+    // Build the HTTP client once so all sync cycles share the same connection
+    // pool and DNS cache — no new TLS handshake every 30 seconds (BUG-A02).
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build HTTP client");
 
-    loop {
-        tokio::select! {
-            _ = sync_tick.tick() => {
-                sync_pending(&pool).await;
-            }
-            _ = cleanup_tick.tick() => {
-                cleanup_old_data(&pool).await;
-            }
+    // Run sync and cleanup as independent loops so a slow sync cycle never
+    // delays the hourly cleanup (and vice-versa).
+    let pool_sync = pool.clone();
+    let client_sync = client.clone(); // cheap clone — Client is Arc-backed internally
+    let app_sync = app.clone();
+    tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(30));
+        // Track last known online state so connectivity-changed is only emitted
+        // when the state actually changes, not on every tick.
+        let mut was_online = true;
+        loop {
+            tick.tick().await;
+            sync_pending(&pool_sync, &client_sync, &app_sync, &mut was_online).await;
         }
+    });
+
+    let mut cleanup_tick = interval(Duration::from_secs(3600));
+    loop {
+        cleanup_tick.tick().await;
+        cleanup_old_data(&pool).await;
     }
 }
 
@@ -37,14 +54,18 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
     let user = User::get_current(pool).await.ok()??;
     match refresh_token(&user.refresh_token).await {
         Ok(res) => {
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE users SET access_token = ?, refresh_token = ? WHERE remote_id = ?",
             )
             .bind(&res.access_token)
             .bind(&res.refresh_token)
             .bind(&user.remote_id)
             .execute(pool)
-            .await;
+            .await
+            {
+                log::error!("[sync] failed to persist refreshed token: {}", e);
+                return None;
+            }
             log::info!("[sync] token refreshed");
             Some(res.access_token)
         }
@@ -61,9 +82,7 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
 
 /// Fetches pending slots from DB and builds entries for bulk sync.
 /// ORDER BY id ensures stable ordering so response indices match slot_ids.
-async fn build_entries(
-    pool: &SqlitePool,
-) -> Result<(Vec<SyncTimeEntry>, Vec<i64>), sqlx::Error> {
+async fn build_entries(pool: &SqlitePool) -> Result<(Vec<SyncTimeEntry>, Vec<i64>), sqlx::Error> {
     let slots = sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
         r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
            FROM time_slots
@@ -79,14 +98,24 @@ async fn build_entries(
     let mut slot_ids = Vec::with_capacity(slots.len());
 
     for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in &slots {
-        let app_usages = sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
+        let app_usages = match sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
             "SELECT app_name, window_title, url, duration_secs, started_at \
              FROM app_usage WHERE time_slot_id = ? AND synced = 0 AND trim(app_name) != ''",
         )
         .bind(slot_id)
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::error!(
+                    "[sync] failed to fetch app_usage for slot {}: {} — skipping slot",
+                    slot_id,
+                    e
+                );
+                continue;
+            }
+        };
 
         entries.push(SyncTimeEntry {
             project_id: project_id.clone(),
@@ -96,15 +125,15 @@ async fn build_entries(
             activity_percent: *activity_percent,
             app_usage: app_usages
                 .into_iter()
-                .map(|(app_name, window_title, url, duration_seconds, started_at)| {
-                    SyncAppUsage {
+                .map(
+                    |(app_name, window_title, url, duration_seconds, started_at)| SyncAppUsage {
                         app_name,
                         window_title,
                         url,
                         duration_seconds,
                         started_at,
-                    }
-                })
+                    },
+                )
                 .collect(),
         });
         slot_ids.push(*slot_id);
@@ -113,21 +142,31 @@ async fn build_entries(
     Ok((entries, slot_ids))
 }
 
-async fn sync_pending(pool: &SqlitePool) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
-
-    if !is_online(&client).await {
-        log::info!("[sync] offline — skipping");
-        return;
-    }
-
+async fn sync_pending(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    app: &AppHandle,
+    was_online: &mut bool,
+) {
+    // Check for a logged-in user first — if nobody is signed in there is
+    // nothing to sync and we avoid an unauthenticated ping to the API server
+    // on every 30-second cycle (BUG-A06 / privacy).
     let user = match User::get_current(pool).await {
         Ok(Some(u)) => u,
         _ => return,
     };
+
+    // Track connectivity changes and emit an event when the state flips.
+    // This lets the frontend show an offline indicator without polling.
+    let online = is_online(client).await;
+    if online != *was_online {
+        let _ = app.emit("connectivity-changed", online);
+        *was_online = online;
+    }
+    if !online {
+        log::info!("[sync] offline — skipping");
+        return;
+    }
 
     let mut token = user.access_token.clone();
 
@@ -149,7 +188,7 @@ async fn sync_pending(pool: &SqlitePool) {
         // Re-fetching is safe because ORDER BY id + same LIMIT returns the same rows.
         // Critically, we also get a fresh slot_ids so indices stay consistent with
         // the entries we send on retry.
-        let (response, final_slot_ids) = match sync_time_entries(&client, &token, entries).await {
+        let (response, final_slot_ids) = match sync_time_entries(client, &token, entries).await {
             Ok(res) => (res, slot_ids),
             Err(e) if e.contains("401") => {
                 log::info!("[sync] 401 — refreshing token");
@@ -163,7 +202,7 @@ async fn sync_pending(pool: &SqlitePool) {
                                 return;
                             }
                         };
-                        match sync_time_entries(&client, &token, entries2).await {
+                        match sync_time_entries(client, &token, entries2).await {
                             Ok(res) => (res, slot_ids2),
                             Err(e) => {
                                 log::error!("[sync] retry failed: {}", e);
@@ -198,20 +237,18 @@ async fn sync_pending(pool: &SqlitePool) {
             let slot_id = final_slot_ids[i];
             let remote_id = &result.id;
 
-            let _ = sqlx::query(
-                "UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?",
-            )
-            .bind(remote_id)
-            .bind(slot_id)
-            .execute(pool)
-            .await;
+            let _ = sqlx::query("UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?")
+                .bind(remote_id)
+                .bind(slot_id)
+                .execute(pool)
+                .await;
 
             let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
                 .bind(slot_id)
                 .execute(pool)
                 .await;
 
-            upload_slot_screenshots(pool, &client, &token, slot_id, remote_id).await;
+            upload_slot_screenshots(pool, client, &token, slot_id, remote_id).await;
 
             log::info!("[sync] slot {} → remote {} ✓", slot_id, remote_id);
         }
@@ -224,11 +261,9 @@ async fn sync_pending(pool: &SqlitePool) {
 
     // Invalid app_usage: rows with empty app_name are skipped during sync but
     // never marked synced, blocking all future cycles. Mark them done now.
-    let _ = sqlx::query(
-        "UPDATE app_usage SET synced = 1 WHERE synced = 0 AND trim(app_name) = ''",
-    )
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE synced = 0 AND trim(app_name) = ''")
+        .execute(pool)
+        .await;
 
     // Orphan app_usage: mark synced so they don't block future sync cycles.
     let orphan = sqlx::query(
@@ -268,8 +303,7 @@ async fn sync_pending(pool: &SqlitePool) {
             orphan_screenshots.len()
         );
         for (screenshot_id, file_path, remote_id, activity_percent) in orphan_screenshots {
-            match upload_screenshot(&client, &token, &remote_id, &file_path, activity_percent)
-                .await
+            match upload_screenshot(client, &token, &remote_id, &file_path, activity_percent).await
             {
                 Ok(_) => {
                     log::info!("[sync] orphan screenshot uploaded: {}", file_path);
@@ -277,11 +311,20 @@ async fn sync_pending(pool: &SqlitePool) {
                         .bind(screenshot_id)
                         .execute(pool)
                         .await;
+                    match tokio::fs::remove_file(&file_path).await {
+                        Ok(_) => log::info!("[sync] orphan screenshot file deleted: {}", file_path),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => log::warn!("[sync] failed to remove orphan screenshot file {}: {}", file_path, e),
+                    }
                 }
                 Err(e) => log::warn!("[sync] orphan screenshot failed: {}", e),
             }
         }
     }
+
+    // Notify the frontend that a full sync cycle completed so it can
+    // refresh "Last updated at" in the footer.
+    let _ = app.emit("sync-completed", Utc::now().to_rfc3339());
 }
 
 async fn upload_slot_screenshots(
@@ -310,6 +353,14 @@ async fn upload_slot_screenshots(
                     .bind(screenshot_id)
                     .execute(pool)
                     .await;
+                // Delete the local file immediately — no reason to keep it on
+                // disk once the server has it. Cleanup happens here, not in the
+                // hourly cleanup cycle, so disk space is freed right away.
+                match tokio::fs::remove_file(&file_path).await {
+                    Ok(_) => log::info!("[sync] screenshot file deleted after upload: {}", file_path),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("[sync] failed to remove screenshot file {}: {}", file_path, e),
+                }
             }
             Err(e) => {
                 sentry::capture_message(
@@ -323,60 +374,13 @@ async fn upload_slot_screenshots(
 }
 
 async fn cleanup_old_data(pool: &SqlitePool) {
-    let old_screenshots = sqlx::query_as::<_, (i64, String)>(
-        r#"SELECT id, file_path FROM screenshots
-           WHERE synced = 1
-           AND datetime(taken_at) < datetime('now', '-24 hours')"#,
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    // Screenshot files are deleted immediately after a successful upload, so
+    // there is no filesystem work to do here — only DB record cleanup.
 
-    let mut deleted_files = 0;
-    let mut deleted_records = 0;
-
-    for (id, file_path) in old_screenshots {
-        match tokio::fs::remove_file(&file_path).await {
-            Ok(_) => deleted_files += 1,
-            Err(e) => log::warn!("[cleanup] file error {}: {}", file_path, e),
-        }
-        if sqlx::query("DELETE FROM screenshots WHERE id = ?")
-            .bind(id)
-            .execute(pool)
-            .await
-            .is_ok()
-        {
-            deleted_records += 1;
-        }
-    }
-
-    if deleted_records > 0 {
-        log::info!(
-            "[cleanup] {} files, {} records removed",
-            deleted_files,
-            deleted_records
-        );
-    }
-
-    // Delete dangling app_usage rows that reference deleted time_slots.
-    // This can happen if cleanup_old_data deleted time_slots rows before the
-    // corresponding app_usage rows were cleaned up (or if they were written after
-    // the slot was already deleted).
-    let dangling = sqlx::query(
-        "DELETE FROM app_usage WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
-    )
-    .execute(pool)
-    .await;
-
-    match dangling {
-        Ok(r) if r.rows_affected() > 0 => {
-            log::info!("[cleanup] deleted {} dangling app_usage rows", r.rows_affected());
-        }
-        Err(e) => log::warn!("[cleanup] dangling app_usage cleanup failed: {}", e),
-        _ => {}
-    }
-
-    let result = sqlx::query(
+    // Remove time_slots that were synced more than 24 hours ago.
+    // Rows are kept for 24 h so that today_secs and recent history remain
+    // queryable by the frontend even after the data is on the server.
+    let slots_result = sqlx::query(
         r#"DELETE FROM time_slots
            WHERE synced = 1
            AND datetime(ended_at) < datetime('now', '-24 hours')"#,
@@ -384,9 +388,50 @@ async fn cleanup_old_data(pool: &SqlitePool) {
     .execute(pool)
     .await;
 
-    if let Ok(r) = result {
-        if r.rows_affected() > 0 {
-            log::info!("[cleanup] deleted {} old slots", r.rows_affected());
+    match slots_result {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!("[cleanup] deleted {} old time_slots", r.rows_affected());
         }
+        Err(e) => log::warn!("[cleanup] failed to delete old time_slots: {}", e),
+        _ => {}
+    }
+
+    // Remove app_usage rows whose parent time_slot was just deleted (or was
+    // already missing from a previous cycle).
+    let dangling_usage = sqlx::query(
+        "DELETE FROM app_usage WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
+    )
+    .execute(pool)
+    .await;
+
+    match dangling_usage {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!(
+                "[cleanup] deleted {} orphaned app_usage rows",
+                r.rows_affected()
+            );
+        }
+        Err(e) => log::warn!("[cleanup] orphaned app_usage cleanup failed: {}", e),
+        _ => {}
+    }
+
+    // Remove screenshot records whose parent time_slot no longer exists.
+    // Files are already gone (deleted after upload); this clears any lingering
+    // DB rows so the orphan-retry query never re-attempts a missing file.
+    let orphan_ss = sqlx::query(
+        "DELETE FROM screenshots WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
+    )
+    .execute(pool)
+    .await;
+
+    match orphan_ss {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!(
+                "[cleanup] deleted {} orphaned screenshot records",
+                r.rows_affected()
+            );
+        }
+        Err(e) => log::warn!("[cleanup] orphaned screenshot records cleanup failed: {}", e),
+        _ => {}
     }
 }

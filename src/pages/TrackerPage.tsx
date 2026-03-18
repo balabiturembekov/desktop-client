@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { User, Project, TimerPayload } from "../types";
@@ -15,32 +15,67 @@ function formatTime(secs: number): string {
   return `${h}:${m}:${s}`;
 }
 
+/** Formats an ISO-8601 timestamp as "DD.MM.YYYY HH:mm" (Hubstaff style). */
+function formatSyncTime(iso: string): string {
+  const d = new Date(iso);
+  const dd = d.getDate().toString().padStart(2, "0");
+  const mm = (d.getMonth() + 1).toString().padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const hh = d.getHours().toString().padStart(2, "0");
+  const min = d.getMinutes().toString().padStart(2, "0");
+  return `${dd}.${mm}.${yyyy} ${hh}:${min}`;
+}
+
 export default function TrackerPage({ user, onLogout }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [totalSecs, setTotalSecs] = useState(0);
   const [isRunning, setIsRunning] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  const [projectsError, setProjectsError] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
+  const [isOnline, setIsOnline] = useState(true);
 
   // Refs for tray throttle — not state, so they don't trigger re-renders
   const lastTrayUpdate = useRef<number>(0);
   const lastTrayIsRunning = useRef<boolean | null>(null);
+  const settingsRef = useRef<HTMLDivElement>(null);
+  // BUG-F07: stable ref so the timer-tick closure can read up-to-date projects
+  const projectsRef = useRef<Project[]>([]);
 
-  useEffect(() => {
-    // Загружаем проекты и today secs параллельно
+  // BUG-F15: wrap in useCallback so the useEffect dependency is stable
+  // BUG-F03: return a cancel function to prevent setState after unmount
+  const loadProjects = useCallback((): (() => void) => {
+    let cancelled = false;
+    setProjectsError(false);
     Promise.all([
       invoke<Project[]>("cmd_get_projects"),
       invoke<number>("cmd_get_today_secs"),
-    ]).then(([p, secs]) => {
-      setProjects(p);
-      if (p.length > 0) setSelectedProject(p[0]);
-      setTotalSecs(secs);
-      setInitialized(true);
-    });
+    ])
+      .then(([p, secs]) => {
+        if (cancelled) return;
+        projectsRef.current = p;
+        setProjects(p);
+        // BUG-F05: clear selection when project list is empty
+        if (p.length > 0) setSelectedProject(p[0]);
+        else setSelectedProject(null);
+        setTotalSecs(secs);
+      })
+      .catch(() => { if (!cancelled) setProjectsError(true); })
+      .finally(() => { if (!cancelled) setInitialized(true); });
+    return () => { cancelled = true; };
   }, []);
 
-useEffect(() => {
+  useEffect(() => {
+    return loadProjects();
+  }, [loadProjects]);
+
+  // BUG-F01: cancelled flag prevents calling unlisten on an already-cleaned-up listener
+  useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     let unlistenDayRollover: (() => void) | undefined;
 
@@ -48,9 +83,15 @@ useEffect(() => {
       setTotalSecs(e.payload.total_secs);
       setIsRunning(e.payload.is_running);
 
+      // BUG-F07: sync selected project when timer carries a project_id
+      // (e.g. started from tray menu while app was closed)
+      if (e.payload.project_id) {
+        const pid = e.payload.project_id;
+        const match = projectsRef.current.find((p) => p.remote_id === pid);
+        if (match) setSelectedProject((cur) => cur?.remote_id === pid ? cur : match);
+      }
+
       // Throttle tray updates: call on is_running change OR every 10s.
-      // Calling set_text/set_tooltip every second causes a race condition
-      // in tao on macOS that crashes the process.
       const now = Date.now();
       const isRunningChanged = e.payload.is_running !== lastTrayIsRunning.current;
       if (isRunningChanged || now - lastTrayUpdate.current >= 10_000) {
@@ -61,17 +102,82 @@ useEffect(() => {
         lastTrayUpdate.current = now;
         lastTrayIsRunning.current = e.payload.is_running;
       }
-    }).then((fn) => (unlisten = fn));
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
 
     listen<void>("day-rollover", () => {
       setTotalSecs(0);
-    }).then((fn) => (unlistenDayRollover = fn));
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenDayRollover = fn;
+    });
 
     return () => {
+      cancelled = true;
       unlisten?.();
       unlistenDayRollover?.();
     };
   }, []);
+
+  // BUG-F01: cancelled flag for sync/connectivity listeners
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenSync: (() => void) | undefined;
+    let unlistenConn: (() => void) | undefined;
+
+    listen<string>("sync-completed", (e) => {
+      setLastSyncAt(e.payload);
+      // BUG-F17: do NOT setIsOnline(true) here — connectivity-changed is the source of truth
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenSync = fn;
+    });
+
+    listen<boolean>("connectivity-changed", (e) => {
+      setIsOnline(e.payload);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenConn = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      unlistenSync?.();
+      unlistenConn?.();
+    };
+  }, []);
+
+  // Read autostart status once on mount
+  useEffect(() => {
+    invoke<boolean>("cmd_autostart_is_enabled")
+      .then(setLaunchAtLogin)
+      .catch(() => {});
+  }, []);
+
+  // Close settings dropdown on click-outside
+  useEffect(() => {
+    if (!showSettings) return;
+    const handler = (e: MouseEvent) => {
+      if (settingsRef.current && !settingsRef.current.contains(e.target as Node)) {
+        setShowSettings(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showSettings]);
+
+  const handleToggleLaunchAtLogin = async () => {
+    const next = !launchAtLogin;
+    try {
+      await invoke(next ? "cmd_autostart_enable" : "cmd_autostart_disable");
+      setLaunchAtLogin(next);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const handleStart = async () => {
     if (!selectedProject || starting) return;
     setStarting(true);
@@ -83,11 +189,21 @@ useEffect(() => {
       setStarting(false);
     }
   };
+
+  const handleRetry = () => {
+    setInitialized(false);
+    loadProjects();
+  };
+
   const handleStop = () => invoke("stop_worker_timer").catch(console.error);
+
+  // BUG-F02/F08: call cmd_logout (which stops timer unconditionally + clears DB)
+  const handleLogout = async () => {
+    await invoke("cmd_logout").catch(console.error);
+    onLogout();
+  };
+
   const handleReset = async () => {
-    if (isRunning) {
-      if (!window.confirm("Timer is running. Reset will discard the current session. Continue?")) return;
-    }
     await invoke("reset_worker_timer").catch(console.error);
   };
 
@@ -114,7 +230,40 @@ useEffect(() => {
         </div>
         <div className="flex items-center gap-3">
           <span className="text-xs text-[#555]">{user.name}</span>
-          <button onClick={onLogout} className="text-[#555] hover:text-red-400 transition text-xs">⏏</button>
+          {/* Settings dropdown */}
+          <div className="relative" ref={settingsRef}>
+            {/* BUG-F11: aria-expanded + aria-label */}
+            <button
+              onClick={() => setShowSettings((s) => !s)}
+              aria-expanded={showSettings}
+              aria-label="Settings"
+              className={`text-sm transition leading-none ${showSettings ? "text-white" : "text-[#555] hover:text-white"}`}
+              title="Settings"
+            >
+              ⚙
+            </button>
+            {showSettings && (
+              <div className="absolute right-0 top-full mt-1.5 w-44 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg py-1 z-10 shadow-xl">
+                <button
+                  onClick={handleToggleLaunchAtLogin}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-xs hover:bg-[#222] transition text-left"
+                >
+                  <span className={launchAtLogin ? "text-[#6ee7b7]" : "text-[#444]"}>
+                    {launchAtLogin ? "☑" : "☐"}
+                  </span>
+                  <span className="text-[#aaa]">Launch at login</span>
+                </button>
+              </div>
+            )}
+          </div>
+          {/* BUG-F11: aria-label for logout button */}
+          <button
+            onClick={handleLogout}
+            aria-label="Logout"
+            className="text-[#555] hover:text-red-400 transition text-xs"
+          >
+            ⏏
+          </button>
         </div>
       </div>
 
@@ -136,20 +285,34 @@ useEffect(() => {
         {/* Project selector */}
         <div className="w-full">
           <label className="block text-xs text-[#555] mb-1.5 uppercase tracking-wider">Project</label>
-          <select
-            value={selectedProject?.remote_id ?? ""}
-            onChange={(e) => {
-              const p = projects.find((p) => p.remote_id === e.target.value);
-              setSelectedProject(p ?? null);
-            }}
-            disabled={isRunning}
-            className="w-full rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] px-3 py-2 text-sm text-white outline-none transition focus:border-[#6ee7b7] disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {projects.length === 0 && <option value="">No projects</option>}
-            {projects.map((p) => (
-              <option key={p.remote_id} value={p.remote_id}>{p.name}</option>
-            ))}
-          </select>
+          {projectsError ? (
+            <div className="rounded-lg bg-[#1a1a1a] border border-red-900 px-3 py-2.5 flex items-center justify-between gap-3">
+              <span className="text-xs text-red-400">
+                Couldn't load projects — check your connection
+              </span>
+              <button
+                onClick={handleRetry}
+                className="shrink-0 text-xs text-[#6ee7b7] hover:text-[#a7f3d0] transition font-semibold"
+              >
+                Retry
+              </button>
+            </div>
+          ) : (
+            <select
+              value={selectedProject?.remote_id ?? ""}
+              onChange={(e) => {
+                const p = projects.find((p) => p.remote_id === e.target.value);
+                setSelectedProject(p ?? null);
+              }}
+              disabled={isRunning}
+              className="w-full rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] px-3 py-2 text-sm text-white outline-none transition focus:border-[#6ee7b7] disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {projects.length === 0 && <option value="">No projects</option>}
+              {projects.map((p) => (
+                <option key={p.remote_id} value={p.remote_id}>{p.name}</option>
+              ))}
+            </select>
+          )}
         </div>
 
         {/* Controls */}
@@ -170,9 +333,11 @@ useEffect(() => {
               ■ Stop
             </button>
           )}
+          {/* BUG-F11: aria-label for reset button */}
           <button
             onClick={handleReset}
             disabled={isRunning || totalSecs === 0}
+            aria-label="Reset timer"
             className="rounded-lg bg-[#1a1a1a] border border-[#2a2a2a] px-4 py-2.5 text-sm text-[#555] transition hover:text-white hover:border-[#444] disabled:opacity-30 disabled:cursor-not-allowed"
           >
             ↺
@@ -182,10 +347,22 @@ useEffect(() => {
 
       {/* Footer */}
       <div className="px-4 py-2 border-t border-[#1e1e1e] flex items-center justify-between">
-        <div className="flex items-center gap-1.5">
-          <div className={`h-1.5 w-1.5 rounded-full ${isRunning ? "bg-[#6ee7b7]" : "bg-[#333]"}`} />
-          <span className="text-xs text-[#555]">{isRunning ? "Tracking" : "Idle"}</span>
-        </div>
+        {isOnline ? (
+          <div className="flex items-center gap-1.5">
+            <svg width="10" height="10" viewBox="0 0 10 10" className="shrink-0">
+              <circle cx="5" cy="5" r="4.5" fill="none" stroke="#6ee7b7" strokeWidth="1"/>
+              <path d="M3 5l1.5 1.5L7 3.5" stroke="#6ee7b7" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            <span className="text-xs text-[#555]">
+              {lastSyncAt ? `Last sync: ${formatSyncTime(lastSyncAt)}` : "Syncing…"}
+            </span>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5">
+            <div className="h-1.5 w-1.5 rounded-full bg-red-500" />
+            <span className="text-xs text-red-500">Offline</span>
+          </div>
+        )}
         {selectedProject && (
           <span className="text-xs text-[#444] truncate max-w-[150px]">{selectedProject.name}</span>
         )}

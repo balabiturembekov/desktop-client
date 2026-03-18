@@ -68,8 +68,13 @@ pub async fn sync_time_entries(
 
     if !res.status().is_success() {
         let status = res.status();
+        // Log the full server body locally for debugging but return only the
+        // HTTP status code in the Err string — the caller forwards that string
+        // to Sentry, and server-internal details (stack traces, SQL errors)
+        // must not end up in third-party error tracking (BUG-A07).
         let body = res.text().await.unwrap_or_default();
-        return Err(format!("Sync failed: {} — {}", status, body));
+        log::error!("[sync] server error response body: {}", body);
+        return Err(format!("Sync failed: {}", status));
     }
 
     res.json::<SyncTimeEntriesResponse>()

@@ -37,3 +37,8 @@ sentry = { version = "0.34", default-features = false, features = ["backtrace", 
 tauri-plugin-updater = "2.10.0"
 tauri-plugin-log = "2"
 active-win-pos-rs = "0.9"
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+
+[target."cfg(target_os = \"macos\")".dependencies]
+macos-accessibility-client = "0.0.2"

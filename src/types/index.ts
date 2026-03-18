@@ -1,5 +1,4 @@
 export interface User {
-  id: number;
   remote_id: string;
   email: string;
   name: string;
@@ -11,14 +10,14 @@ export interface User {
 }
 
 export interface Project {
-  id: number;
   remote_id: string;
   name: string;
-  is_active: number;
+  is_active: 0 | 1;
   created_at: string;
 }
 
 export interface TimerPayload {
   total_secs: number;
   is_running: boolean;
+  project_id?: string;
 }

@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Datelike, Local, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Emitter, Manager};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::WebviewUrl;
 use tauri::WebviewWindowBuilder;
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
@@ -16,6 +16,11 @@ use crate::tracker::models::ActivityState;
 const IDLE_TIMEOUT_SECS: i64 = 300;
 const CHUNK_SECS: i64 = 600; // 10 минут
 const PROGRESS_SAVE_EVERY_SECS: i64 = 60; // обновлять stub каждую минуту
+/// Gap between consecutive 1-second ticks that indicates a system suspend/resume.
+/// tokio::time::interval uses a monotonic clock (advances during sleep on macOS),
+/// so on wake the tick fires immediately — but Utc::now() also advanced.
+/// Comparing wall-clock elapsed since the last tick lets us detect suspend cycles.
+const SLEEP_DETECT_SECS: i64 = 60;
 
 /// Возвращает ключ текущего дня как (year, ordinal).
 /// Использование пары year+ordinal вместо одного ordinal корректно
@@ -42,6 +47,7 @@ fn midnight_utc_of(dt: &DateTime<Local>) -> DateTime<Utc> {
 pub struct TimerPayload {
     pub total_secs: u64,
     pub is_running: bool,
+    pub project_id: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -51,7 +57,7 @@ pub struct IdlePayload {
 
 async fn get_today_secs(pool: &SqlitePool) -> i64 {
     sqlx::query_as::<_, (Option<i64>,)>(
-        "SELECT SUM(duration_secs) FROM time_slots WHERE date(started_at) = date('now')"
+        "SELECT SUM(duration_secs) FROM time_slots WHERE date(started_at, 'localtime') = date('now', 'localtime')"
     )
     .fetch_one(pool)
     .await
@@ -73,7 +79,11 @@ async fn save_chunk(
     let ended_at_str = ended_at.to_rfc3339();
     let active = activity.active_seconds.load(Ordering::Relaxed);
     let total = activity.total_seconds.load(Ordering::Relaxed);
-    let percent = if total > 0 { ((active * 100) / total) as i64 } else { 0 };
+    let percent = if total > 0 {
+        ((active * 100) / total) as i64
+    } else {
+        0
+    };
 
     match sqlx::query(
         r#"INSERT INTO time_slots
@@ -90,7 +100,12 @@ async fn save_chunk(
     {
         Ok(result) => {
             let slot_id = result.last_insert_rowid();
-            log::info!("[timer] chunk saved: {}s, {}% activity, slot_id={}", duration_secs, percent, slot_id);
+            log::info!(
+                "[timer] chunk saved: {}s, {}% activity, slot_id={}",
+                duration_secs,
+                percent,
+                slot_id
+            );
             Some(slot_id)
         }
         Err(e) => {
@@ -147,7 +162,11 @@ async fn update_slot(
     let duration_secs = (ended_at - started_at).num_seconds().max(0);
     let active = activity.active_seconds.load(Ordering::Relaxed);
     let total = activity.total_seconds.load(Ordering::Relaxed);
-    let percent = if total > 0 { ((active * 100) / total) as i64 } else { 0 };
+    let percent = if total > 0 {
+        ((active * 100) / total) as i64
+    } else {
+        0
+    };
 
     match sqlx::query(
         "UPDATE time_slots SET ended_at = ?, duration_secs = ?, activity_percent = ? WHERE id = ?",
@@ -161,7 +180,9 @@ async fn update_slot(
     {
         Ok(_) => log::info!(
             "[timer] slot {} updated: {}s, {}% activity",
-            slot_id, duration_secs, percent
+            slot_id,
+            duration_secs,
+            percent
         ),
         Err(e) => log::warn!("[timer] slot update failed: {}", e),
     }
@@ -213,11 +234,17 @@ pub async fn time_actor(
     let mut last_progress_save: i64 = 0; // chunk_elapsed_secs на момент последнего прогресс-сейва
     let mut idle_window_opened = false;
     let mut tick = interval(Duration::from_secs(1));
+    // Wall-clock time of the previous tick — used to detect system sleep/wake.
+    // Updated at Start (reset) and on every tick.
+    let mut last_tick_at: DateTime<Utc> = Utc::now();
 
     let mut today_secs_cache = get_today_secs(&pool).await;
     let mut current_day = day_key(&Local::now());
 
-    log::info!("[timer] initialized with {} secs from today", today_secs_cache);
+    log::info!(
+        "[timer] initialized with {} secs from today",
+        today_secs_cache
+    );
 
     loop {
         tokio::select! {
@@ -262,9 +289,13 @@ pub async fn time_actor(
 
                             current_project_id = Some(project_id);
                             tick.reset();
+                            // Reset last_tick_at so the first post-start tick doesn't
+                            // misidentify the idle period before Start as a sleep gap.
+                            last_tick_at = Utc::now();
                             let _ = app.emit("timer-tick", TimerPayload {
                                 total_secs: today_secs_cache as u64,
                                 is_running: true,
+                                project_id: current_project_id.clone(),
                             });
                         }
                     }
@@ -303,6 +334,7 @@ pub async fn time_actor(
                             let _ = app.emit("timer-tick", TimerPayload {
                                 total_secs: today_secs_cache as u64,
                                 is_running: false,
+                                project_id: None,
                             });
                         }
                     }
@@ -339,12 +371,63 @@ pub async fn time_actor(
                         let _ = app.emit("timer-tick", TimerPayload {
                             total_secs: today_secs_cache as u64,
                             is_running: false,
+                            project_id: None,
                         });
                     }
                     None => break,
                 }
             }
             _ = tick.tick(), if running => {
+                // ── Sleep/wake detection ──────────────────────────────────────
+                // Compute wall-clock time since the previous tick. On macOS,
+                // tokio's monotonic interval advances during system sleep, so the
+                // interval fires immediately on wake — but Utc::now() shows the
+                // full wall-clock gap including sleep time. A gap > SLEEP_DETECT_SECS
+                // means the machine was suspended; finalize the chunk up to the
+                // pre-sleep moment and stop the timer so the idle dialog appears.
+                let now_utc = Utc::now();
+                let real_elapsed = (now_utc - last_tick_at).num_seconds();
+                let prev_tick_at = last_tick_at;
+                last_tick_at = now_utc;
+
+                if real_elapsed > SLEEP_DETECT_SECS {
+                    log::warn!(
+                        "[timer] sleep/wake detected: {}s gap — finalizing chunk at pre-sleep time",
+                        real_elapsed
+                    );
+                    running = false;
+                    idle_window_opened = true;
+                    is_running_flag.store(false, Ordering::Relaxed);
+
+                    let started_at_opt = chunk_started_at.take();
+                    let sid = stub_slot_id.take();
+                    if let (Some(started_at), Some(ref project_id)) =
+                        (started_at_opt, &current_project_id)
+                    {
+                        finalize_slot(&pool, project_id, sid, started_at, prev_tick_at, &activity)
+                            .await;
+                    }
+
+                    current_project_id = None;
+                    last_activity_at = None;
+                    last_seen_activity_ts = 0;
+                    chunk_elapsed_secs = 0;
+                    last_progress_save = 0;
+                    activity.active_seconds.store(0, Ordering::Relaxed);
+                    activity.total_seconds.store(0, Ordering::Relaxed);
+                    *current_slot_id.lock().await = None;
+
+                    today_secs_cache = get_today_secs(&pool).await;
+                    let _ = app.emit("timer-tick", TimerPayload {
+                        total_secs: today_secs_cache as u64,
+                        is_running: false,
+                        project_id: None,
+                    });
+
+                    open_idle_window(&app, real_elapsed as u64);
+                    continue;
+                }
+
                 // Day rollover
                 let now_local = Local::now();
                 let now_day = day_key(&now_local);
@@ -387,6 +470,7 @@ pub async fn time_actor(
                     let _ = app.emit("timer-tick", TimerPayload {
                         total_secs: 0,
                         is_running: true,
+                        project_id: current_project_id.clone(),
                     });
                     continue;
                 }
@@ -403,7 +487,11 @@ pub async fn time_actor(
                 }
 
                 if let Some(last_active) = last_activity_at {
-                    let idle_secs = (Utc::now() - last_active).num_seconds();
+                    // .max(0): if the system clock is adjusted backward last_active
+                    // can land in the future, making the difference negative. Without
+                    // the clamp, idle_secs < 0 means the idle check never fires and
+                    // the timer runs forever without auto-saving (BUG-A04).
+                    let idle_secs = (Utc::now() - last_active).num_seconds().max(0);
                     if idle_secs >= IDLE_TIMEOUT_SECS && !idle_window_opened {
                         log::info!("[timer] idle: {} secs", idle_secs);
                         running = false;
@@ -434,6 +522,7 @@ pub async fn time_actor(
                         let _ = app.emit("timer-tick", TimerPayload {
                             total_secs: today_secs_cache as u64,
                             is_running: false,
+                            project_id: None,
                         });
 
                         open_idle_window(&app, idle_secs as u64);
@@ -484,6 +573,7 @@ pub async fn time_actor(
                 let _ = app.emit("timer-tick", TimerPayload {
                     total_secs: today_secs_cache as u64 + session_secs,
                     is_running: true,
+                    project_id: current_project_id.clone(),
                 });
             }
         }
@@ -504,7 +594,11 @@ mod tests {
         let dec31 = Local.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap();
         let jan01 = Local.with_ymd_and_hms(2025, 1, 1, 0, 0, 1).unwrap();
 
-        assert_ne!(day_key(&dec31), day_key(&jan01), "year boundary must be detected");
+        assert_ne!(
+            day_key(&dec31),
+            day_key(&jan01),
+            "year boundary must be detected"
+        );
         assert_eq!(day_key(&dec31), (2024, 366));
         assert_eq!(day_key(&jan01), (2025, 1));
     }
@@ -530,9 +624,17 @@ mod tests {
     fn test_day_key_same_ordinal_different_year() {
         let y2024 = Local.with_ymd_and_hms(2024, 4, 9, 12, 0, 0).unwrap(); // ordinal 100
         let y2025 = Local.with_ymd_and_hms(2025, 4, 10, 12, 0, 0).unwrap(); // ordinal 100
-        // Оба ordinal == 100, но годы разные → ключи должны быть разные
-        assert_eq!(y2024.ordinal(), y2025.ordinal(), "setup: both should be day 100");
-        assert_ne!(day_key(&y2024), day_key(&y2025), "different years must not be equal");
+                                                                            // Оба ordinal == 100, но годы разные → ключи должны быть разные
+        assert_eq!(
+            y2024.ordinal(),
+            y2025.ordinal(),
+            "setup: both should be day 100"
+        );
+        assert_ne!(
+            day_key(&y2024),
+            day_key(&y2025),
+            "different years must not be equal"
+        );
     }
 
     // ── midnight_utc_of ───────────────────────────────────────────────────────
@@ -622,6 +724,9 @@ mod tests {
         let midnight = midnight_utc_of(&tick_local);
 
         let secs_yesterday = (midnight - chunk_start).num_seconds().max(0);
-        assert_eq!(secs_yesterday, 0, "chunk started after midnight — no yesterday portion");
+        assert_eq!(
+            secs_yesterday, 0,
+            "chunk started after midnight — no yesterday portion"
+        );
     }
 }

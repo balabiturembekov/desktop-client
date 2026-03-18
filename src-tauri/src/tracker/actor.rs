@@ -1,8 +1,8 @@
+use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::time::{interval, Duration};
-use serde::Serialize;
 
 use crate::tracker::models::ActivityState;
 

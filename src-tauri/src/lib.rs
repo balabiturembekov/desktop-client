@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::Emitter;
-use tauri::Manager;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::Emitter;
+use tauri::Manager;
 use tokio::sync::{mpsc, Mutex};
 mod api;
 mod app;
@@ -15,8 +15,9 @@ mod timer;
 mod tracker;
 
 use app::commands::{
+    cmd_autostart_disable, cmd_autostart_enable, cmd_autostart_is_enabled,
     cmd_download_and_install, cmd_force_quit, cmd_get_current_user, cmd_get_projects,
-    cmd_get_today_secs, cmd_login, cmd_open_accessibility_settings, cmd_restart_app,
+    cmd_get_today_secs, cmd_login, cmd_logout, cmd_open_accessibility_settings,
     cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, cmd_update_tray_status,
     CloseRequestedPayload, TrayState,
 };
@@ -29,7 +30,11 @@ use timer::{
     commands::{reset_worker_timer, start_worker_timer, stop_worker_timer},
     models::{TimerCommand, TimerState},
 };
-use tracker::{actor::activity_actor, listener::start_listener, models::ActivityState};
+use tracker::{
+    actor::activity_actor,
+    listener::{is_accessibility_trusted, start_listener},
+    models::ActivityState,
+};
 
 pub fn run() {
     let _sentry = sentry::init((
@@ -45,8 +50,18 @@ pub fn run() {
         },
     ));
 
-
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -119,9 +134,20 @@ pub fn run() {
                 current_slot_id,
             ));
 
-            tauri::async_runtime::spawn(sync_actor(pool.clone()));
+            tauri::async_runtime::spawn(sync_actor(pool.clone(), handle.clone()));
 
             app.manage(pool);
+
+            // Emit "permissions-required" at startup if Accessibility is not granted.
+            // Deferred by 500ms so the webview's event listeners are ready to receive it.
+            let perm_handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if !is_accessibility_trusted() {
+                    log::warn!("[permissions] Accessibility not granted at startup");
+                    let _ = perm_handle.emit("permissions-required", ());
+                }
+            });
 
             // ── System Tray ──────────────────────────────────────────────
             let show_item = MenuItemBuilder::with_id("show", "Show Hubnity").build(app)?;
@@ -138,10 +164,7 @@ pub fn run() {
                 .item(&quit_item)
                 .build()?;
 
-            let icon = app
-                .default_window_icon()
-                .expect("no default icon")
-                .clone();
+            let icon = app.default_window_icon().expect("no default icon").clone();
 
             TrayIconBuilder::with_id("main")
                 .icon(icon)
@@ -196,9 +219,7 @@ pub fn run() {
                                 .ok()
                                 .flatten();
                                 if let Some((project_id,)) = last {
-                                    let _ = sender
-                                        .send(TimerCommand::Start { project_id })
-                                        .await;
+                                    let _ = sender.send(TimerCommand::Start { project_id }).await;
                                 }
                             });
                         }
@@ -208,7 +229,10 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            app.manage(TrayState { timer_item, last_tooltip: std::sync::Mutex::new(None) });
+            app.manage(TrayState {
+                timer_item,
+                last_tooltip: std::sync::Mutex::new(None),
+            });
 
             Ok(())
         })
@@ -238,6 +262,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             cmd_login,
+            cmd_logout,
             cmd_get_current_user,
             cmd_get_projects,
             cmd_get_today_secs,
@@ -247,11 +272,13 @@ pub fn run() {
             stop_worker_timer,
             reset_worker_timer,
             cmd_force_quit,
-            cmd_restart_app,
             cmd_open_accessibility_settings,
             cmd_stop_and_quit,
             cmd_update_tray_status,
             cmd_download_and_install,
+            cmd_autostart_enable,
+            cmd_autostart_disable,
+            cmd_autostart_is_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -274,13 +301,11 @@ async fn check_close_requested(app: tauri::AppHandle) {
             .map(|s| s.is_running.load(Ordering::Relaxed))
             .unwrap_or(false);
 
-        let count = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM time_slots WHERE synced = 0",
-        )
-        .fetch_one(&pool)
-        .await
-        .map(|(c,)| c)
-        .unwrap_or(0);
+        let count = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM time_slots WHERE synced = 0")
+            .fetch_one(&pool)
+            .await
+            .map(|(c,)| c)
+            .unwrap_or(0);
 
         (count, timer_running)
     };

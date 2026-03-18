@@ -2,6 +2,7 @@ use chrono::Utc;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tokio::time::Duration;
 
 use crate::api::auth::{fetch_projects, login};
@@ -32,6 +33,7 @@ pub struct UpdateProgressPayload {
 
 #[tauri::command]
 pub async fn cmd_login(
+    app: tauri::AppHandle,
     email: String,
     password: String,
     pool: State<'_, SqlitePool>,
@@ -61,43 +63,40 @@ pub async fn cmd_login(
             created_at: Utc::now().to_rfc3339(),
         })
         .collect();
-    Project::save_many(&pool, &projects).await.map_err(|e| e.to_string())?;
+    Project::save_many(&pool, &projects)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Enable autostart on first login so the app launches automatically
+    // with the system without requiring any manual configuration.
+    if let Err(e) = app.autolaunch().enable() {
+        log::warn!("[autostart] failed to enable at login: {}", e);
+    } else {
+        log::info!("[autostart] enabled at login");
+    }
+
     Ok(user)
 }
 
 #[tauri::command]
-pub async fn cmd_get_current_user(
-    pool: State<'_, SqlitePool>,
-) -> Result<Option<User>, String> {
+pub async fn cmd_get_current_user(pool: State<'_, SqlitePool>) -> Result<Option<User>, String> {
     User::get_current(&pool).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn cmd_get_projects(
-    pool: State<'_, SqlitePool>,
-) -> Result<Vec<Project>, String> {
+pub async fn cmd_get_projects(pool: State<'_, SqlitePool>) -> Result<Vec<Project>, String> {
     Project::get_active(&pool).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn cmd_get_today_secs(
-    pool: State<'_, SqlitePool>,
-) -> Result<u64, String> {
+pub async fn cmd_get_today_secs(pool: State<'_, SqlitePool>) -> Result<u64, String> {
     let row = sqlx::query_as::<_, (Option<i64>,)>(
-        "SELECT SUM(duration_secs) FROM time_slots WHERE date(started_at) = date('now')"
+        "SELECT SUM(duration_secs) FROM time_slots WHERE date(started_at, 'localtime') = date('now', 'localtime')",
     )
     .fetch_one(&*pool)
     .await
     .map_err(|e| e.to_string())?;
     Ok(row.0.unwrap_or(0) as u64)
-}
-
-/// Restarts the app. Used when a system permission (e.g. Accessibility) is granted
-/// in System Preferences — macOS only propagates the change to new processes,
-/// so a restart is required for the running app to see it.
-#[tauri::command]
-pub async fn cmd_restart_app(app: tauri::AppHandle) -> Result<(), String> {
-    app.restart()
 }
 
 /// Opens the macOS Accessibility privacy pane in System Settings / System Preferences.
@@ -143,10 +142,16 @@ pub async fn cmd_stop_and_quit(
     app: tauri::AppHandle,
     state: State<'_, TimerState>,
 ) -> Result<(), String> {
-    // Отправляем Stop — актор сохранит незаконченный чанк в DB
-    let _ = state.sender.send(TimerCommand::Stop).await;
-    // Даём актору время записать чанк в SQLite
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Only wait for the actor if the timer is actually running; otherwise
+    // there is no chunk to flush and the 600 ms delay is pure waste.
+    if state
+        .is_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = state.sender.send(TimerCommand::Stop).await;
+        // Give the actor time to write the final chunk to SQLite.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
     app.exit(0);
     Ok(())
 }
@@ -171,10 +176,7 @@ pub async fn cmd_update_tray_status(
 
     // De-duplicate: skip if nothing changed since last call.
     {
-        let mut cache = tray_state
-            .last_tooltip
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let mut cache = tray_state.last_tooltip.lock().map_err(|e| e.to_string())?;
         if cache.as_ref() == Some(&(is_running, tooltip.clone())) {
             return Ok(());
         }
@@ -184,12 +186,17 @@ pub async fn cmd_update_tray_status(
     // Update the menu item label
     tray_state
         .timer_item
-        .set_text(if is_running { "Stop Timer" } else { "Start Timer" })
+        .set_text(if is_running {
+            "Stop Timer"
+        } else {
+            "Start Timer"
+        })
         .map_err(|e| e.to_string())?;
 
     // Update tray tooltip
     if let Some(tray) = app.tray_by_id("main") {
-        tray.set_tooltip(Some(&tooltip)).map_err(|e| e.to_string())?;
+        tray.set_tooltip(Some(&tooltip))
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -256,7 +263,7 @@ pub async fn cmd_resume_after_idle(
     pool: State<'_, SqlitePool>,
 ) -> Result<(), String> {
     let last_project = sqlx::query_as::<_, (String,)>(
-        "SELECT project_id FROM time_slots ORDER BY id DESC LIMIT 1"
+        "SELECT project_id FROM time_slots ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(&*pool)
     .await
@@ -265,7 +272,8 @@ pub async fn cmd_resume_after_idle(
     close_idle_and_enable_main(&app);
 
     if let Some((project_id,)) = last_project {
-        state.sender
+        state
+            .sender
             .send(TimerCommand::Start { project_id })
             .await
             .map_err(|e| e.to_string())?;
@@ -279,8 +287,50 @@ pub async fn cmd_stop_after_idle(
     state: State<'_, TimerState>,
 ) -> Result<(), String> {
     close_idle_and_enable_main(&app);
-    state.sender
+    state
+        .sender
         .send(TimerCommand::Stop)
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// Stops the timer (idempotent) and clears all user/project rows so the
+/// frontend can return to the login screen with a clean slate.
+#[tauri::command]
+pub async fn cmd_logout(
+    state: State<'_, TimerState>,
+    pool: State<'_, SqlitePool>,
+) -> Result<(), String> {
+    // Stop unconditionally — TimerCommand::Stop is a no-op if not running.
+    let _ = state.sender.send(TimerCommand::Stop).await;
+    // Give the actor time to finalize the current chunk before clearing the DB.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sqlx::query("DELETE FROM users")
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM projects")
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cmd_autostart_enable(app: tauri::AppHandle) -> Result<(), String> {
+    app.autolaunch().enable().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_autostart_disable(app: tauri::AppHandle) -> Result<(), String> {
+    app.autolaunch()
+        .disable()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_autostart_is_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
         .map_err(|e| e.to_string())
 }

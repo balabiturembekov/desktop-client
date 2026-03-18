@@ -73,8 +73,7 @@ pub async fn app_tracker_actor(
         };
 
         // Sample active window on a blocking OS thread.
-        let result =
-            tokio::task::spawn_blocking(active_win_pos_rs::get_active_window).await;
+        let result = tokio::task::spawn_blocking(active_win_pos_rs::get_active_window).await;
 
         let window = match result {
             Ok(Ok(w)) => {
@@ -105,12 +104,11 @@ pub async fn app_tracker_actor(
             }
         };
 
-        log::info!(
-            "[app_tracker] tick {} — app='{}' title='{}'",
-            tick_count,
-            window.app_name,
-            window.title
-        );
+        // Window titles can contain sensitive content (email subjects, document
+        // names, banking pages). Log only the app name at INFO so these stay
+        // out of production log files; full title goes to DEBUG only (BUG-A01).
+        log::info!("[app_tracker] tick {} — app='{}'", tick_count, window.app_name);
+        log::debug!("[app_tracker] tick {} — title='{}'", tick_count, window.title);
 
         // Skip our own app.
         if window.app_name.to_lowercase().contains("hubnity") {
