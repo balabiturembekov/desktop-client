@@ -105,10 +105,12 @@ pub fn run() {
 
             // Восстановление зависших stub-слотов (synced=2) при запуске приложения
             // Выполняем синхронно перед запуском акторов
-            match sqlx::query("UPDATE time_slots SET synced = 0 WHERE synced = 2")
-                .execute(&pool)
-                .await
-            {
+            let recovery_result: Result<_, _> = tauri::async_runtime::block_on(async {
+                sqlx::query("UPDATE time_slots SET synced = 0 WHERE synced = 2")
+                    .execute(&pool)
+                    .await
+            });
+            match recovery_result {
                 Ok(result) => {
                     if result.rows_affected() > 0 {
                         log::info!(
