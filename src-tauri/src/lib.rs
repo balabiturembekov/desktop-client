@@ -103,6 +103,25 @@ pub fn run() {
                 Arc::new(Mutex::new(TrackingSettings::default()));
             app.manage(tracking_settings.clone());
 
+            // Восстановление зависших stub-слотов (synced=2) при запуске приложения
+            // Выполняем синхронно перед запуском акторов
+            match sqlx::query("UPDATE time_slots SET synced = 0 WHERE synced = 2")
+                .execute(&pool)
+                .await
+            {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        log::info!(
+                            "[recovery] recovered {} stale stub slots at startup",
+                            result.rows_affected()
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::error!("[recovery] failed to recover stale slots at startup: {}", e);
+                }
+            }
+
             let (tx, rx) = mpsc::channel(8);
             tauri::async_runtime::spawn(time_actor(
                 rx,
