@@ -125,8 +125,10 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
 
 /// Fetches pending slots from DB.
 ///
-/// Returns `(entries, slot_meta)` where `slot_meta[i] = (slot_id, started_at)`.
+/// Returns `(entries, slot_meta)` where `slot_meta[i] = (slot_id, started_at, has_usage)`.
 /// `started_at` is used for result matching instead of positional indexing.
+/// `has_usage` is `true` when the slot had at least one app_usage row, letting
+/// the caller skip the `UPDATE app_usage SET synced=1` no-op for empty slots.
 ///
 /// Filters:
 /// - `synced = 0 AND ended_at IS NOT NULL AND duration_secs > 0` — ready to sync
@@ -135,7 +137,7 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
 /// `app_usage` is capped at `MAX_APP_USAGE_PER_SLOT` rows to avoid oversized payloads.
 async fn build_entries(
     pool: &SqlitePool,
-) -> Result<(Vec<SyncTimeEntry>, Vec<(i64, String)>), sqlx::Error> {
+) -> Result<(Vec<SyncTimeEntry>, Vec<(i64, String, bool)>), sqlx::Error> {
     let slots = sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
         r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
            FROM time_slots
@@ -152,7 +154,7 @@ async fn build_entries(
     .await?;
 
     let mut entries = Vec::with_capacity(slots.len());
-    let mut slot_meta: Vec<(i64, String)> = Vec::with_capacity(slots.len());
+    let mut slot_meta: Vec<(i64, String, bool)> = Vec::with_capacity(slots.len());
 
     for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in &slots {
         let app_usages = match sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
@@ -174,6 +176,7 @@ async fn build_entries(
             }
         };
 
+        let has_usage = !app_usages.is_empty();
         entries.push(SyncTimeEntry {
             project_id: project_id.clone(),
             started_at: started_at.clone(),
@@ -196,7 +199,9 @@ async fn build_entries(
                 )
                 .collect(),
         });
-        slot_meta.push((*slot_id, started_at.clone()));
+        // has_usage is stored so the caller can skip the app_usage UPDATE
+        // for slots that had no rows — avoids a guaranteed no-op round-trip.
+        slot_meta.push((*slot_id, started_at.clone(), has_usage));
     }
 
     Ok((entries, slot_meta))
@@ -316,7 +321,7 @@ async fn sync_pending(
             None
         };
 
-        for (i, (slot_id, started_at)) in final_meta.iter().enumerate() {
+        for (i, (slot_id, started_at, has_usage)) in final_meta.iter().enumerate() {
             let result: &SyncEntryResult = if let Some(ref map) = result_map {
                 // Safe path: match by started_at
                 match map.get(started_at.as_str()) {
@@ -362,10 +367,14 @@ async fn sync_pending(
                     .execute(pool)
                     .await;
 
-            let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
-                .bind(slot_id)
-                .execute(pool)
-                .await;
+            // Skip the UPDATE when the slot had no app_usage rows — avoids a
+            // guaranteed no-op round-trip to the DB.
+            if *has_usage {
+                let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
+                    .bind(slot_id)
+                    .execute(pool)
+                    .await;
+            }
 
             upload_slot_screenshots(pool, client, &token, *slot_id, &result.id).await;
 
@@ -561,85 +570,36 @@ async fn upload_slot_screenshots(
 }
 
 async fn cleanup_old_data(pool: &SqlitePool) {
-    // Delete time_slots synced more than 24 h ago — but only if ALL their
-    // screenshots are also synced. Deleting a slot before its screenshots
-    // upload would lose the JOIN in the orphan-retry query, making those
-    // screenshots permanently invisible to the sync pipeline (data loss).
+    // Single query covers both expiry cases:
+    //   1. Synced slots older than 24 h with no pending screenshots.
+    //      Guard against deleting a slot whose screenshots haven't uploaded yet —
+    //      that would sever the JOIN in the orphan-retry query (data loss).
+    //   2. Permanently-failed slots (sync_attempts ≥ MAX) older than 7 days.
+    //      These never reach synced=1, so the normal 24 h path never touches them.
+    //
+    // NOTE: DISTINCT is intentionally omitted from the subquery — NOT IN only
+    // checks membership, so duplicates are harmless and DISTINCT adds wasted work.
     let slots_result = sqlx::query(
         r#"DELETE FROM time_slots
-           WHERE synced = 1
-             AND datetime(ended_at) < datetime('now', '-24 hours')
-             AND id NOT IN (
-                 SELECT DISTINCT time_slot_id FROM screenshots WHERE synced = 0
-             )"#,
-    )
-    .execute(pool)
-    .await;
-
-    match slots_result {
-        Ok(r) if r.rows_affected() > 0 => {
-            log::info!("[cleanup] deleted {} old time_slots", r.rows_affected());
-        }
-        Err(e) => log::warn!("[cleanup] failed to delete old time_slots: {}", e),
-        _ => {}
-    }
-
-    // Permanently-failed slots (sync_attempts >= MAX_SYNC_ATTEMPTS) are never
-    // cleaned by the normal path (synced stays 0). Delete them after 7 days.
-    let failed_result = sqlx::query(
-        r#"DELETE FROM time_slots
-           WHERE synced = 0
-             AND sync_attempts >= ?
-             AND datetime(ended_at) < datetime('now', '-7 days')"#,
+           WHERE (synced = 1
+                  AND datetime(ended_at) < datetime('now', '-24 hours')
+                  AND id NOT IN (SELECT time_slot_id FROM screenshots WHERE synced = 0))
+              OR (synced = 0
+                  AND sync_attempts >= ?
+                  AND datetime(ended_at) < datetime('now', '-7 days'))"#,
     )
     .bind(MAX_SYNC_ATTEMPTS)
     .execute(pool)
     .await;
 
-    match failed_result {
+    match slots_result {
         Ok(r) if r.rows_affected() > 0 => {
-            log::info!(
-                "[cleanup] deleted {} permanently-failed time_slots",
-                r.rows_affected()
-            );
+            log::info!("[cleanup] deleted {} time_slots", r.rows_affected());
         }
-        Err(e) => log::warn!("[cleanup] failed to delete failed time_slots: {}", e),
+        Err(e) => log::warn!("[cleanup] failed to delete time_slots: {}", e),
         _ => {}
     }
 
-    // Remove app_usage rows whose parent time_slot was deleted.
-    let dangling_usage = sqlx::query(
-        "DELETE FROM app_usage WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
-    )
-    .execute(pool)
-    .await;
-
-    match dangling_usage {
-        Ok(r) if r.rows_affected() > 0 => {
-            log::info!(
-                "[cleanup] deleted {} orphaned app_usage rows",
-                r.rows_affected()
-            );
-        }
-        Err(e) => log::warn!("[cleanup] orphaned app_usage cleanup failed: {}", e),
-        _ => {}
-    }
-
-    // Remove screenshot records whose parent time_slot no longer exists.
-    let orphan_ss = sqlx::query(
-        "DELETE FROM screenshots WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
-    )
-    .execute(pool)
-    .await;
-
-    match orphan_ss {
-        Ok(r) if r.rows_affected() > 0 => {
-            log::info!(
-                "[cleanup] deleted {} orphaned screenshot records",
-                r.rows_affected()
-            );
-        }
-        Err(e) => log::warn!("[cleanup] orphaned screenshot records cleanup failed: {}", e),
-        _ => {}
-    }
+    // app_usage and screenshots are cleaned up automatically via ON DELETE CASCADE
+    // (migration 011) — no manual orphan queries needed.
 }
