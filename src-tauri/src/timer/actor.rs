@@ -103,11 +103,6 @@ async fn save_chunk(
     .bind(duration_secs)
     .bind(percent)
     .bind(if duration_secs == 0 { 2 } else { 0 })
-    .bind(project_id)
-    .bind(&started_at_str)
-    .bind(&ended_at_str)
-    .bind(duration_secs)
-    .bind(percent)
     .execute(pool)
     .await
     {
