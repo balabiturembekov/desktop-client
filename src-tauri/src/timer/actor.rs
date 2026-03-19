@@ -632,19 +632,21 @@ pub async fn time_actor(
                         // Финализируем текущий stub (fallback to INSERT if stub was missing).
                         finalize_slot(&pool, project_id, stub_slot_id.take(), started_at, ended_at, &activity).await;
 
+                        // Сбрасываем счётчики активности перед созданием нового stub-слота
+                        activity.active_seconds.store(0, Ordering::Relaxed);
+                        activity.total_seconds.store(0, Ordering::Relaxed);
+                        
                         // Создаём новый stub для следующего чанка
                         if let Some(new_sid) = save_chunk(&pool, project_id, ended_at, ended_at, &activity).await {
                             stub_slot_id = Some(new_sid);
                             *current_slot_id.lock().await = Some(new_sid);
                         }
 
-                        // Начинаем новый чанк с текущего времени
+                        // Начинаем новый чанк с времени завершения предыдущего
                         chunk_started_at = Some(ended_at);
-                        // Сбрасываем счётчики
+                        // Сбрасываем счётчики чанка
                         chunk_elapsed_secs = 0;
                         last_progress_save = 0;
-                        activity.active_seconds.store(0, Ordering::Relaxed);
-                        activity.total_seconds.store(0, Ordering::Relaxed);
 
                         // Обновляем кеш общего времени за сегодня
                         today_secs_cache = get_today_secs(&pool).await;
