@@ -78,10 +78,6 @@ export default function IdlePage() {
       style={{ cursor: "grab" }}
     >
       <div className="w-full max-w-[280px] flex flex-col items-center gap-6">
-        <div className="h-12 w-12 rounded-2xl bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
-          <span className="text-2xl">⏸</span>
-        </div>
-
         {/* UX-05: "Your timer has been paused." subtitle */}
         <div className="text-center">
           <h2 className="text-white font-semibold text-base">You've been idle</h2>

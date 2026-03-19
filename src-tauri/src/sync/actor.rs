@@ -1,45 +1,81 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use chrono::Utc;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Mutex;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::api::auth::refresh_token;
-use crate::api::sync::{sync_time_entries, upload_screenshot, SyncAppUsage, SyncTimeEntry};
+use crate::api::sync::{
+    sync_time_entries, upload_screenshot, SyncAppUsage, SyncEntryResult, SyncTimeEntry,
+};
 use crate::db::models::user::User;
 
 /// Max slots to sync per cycle — prevents loading thousands of rows into memory.
 const SYNC_BATCH_LIMIT: i64 = 50;
+/// Max app_usage rows sent per slot — prevents oversized request payloads.
+const MAX_APP_USAGE_PER_SLOT: usize = 100;
+/// After this many failed attempts a slot/screenshot is permanently skipped.
+const MAX_SYNC_ATTEMPTS: i64 = 5;
 
 pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
-    // Build the HTTP client once so all sync cycles share the same connection
-    // pool and DNS cache — no new TLS handshake every 30 seconds (BUG-A02).
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client");
 
-    // Emit initial connectivity state immediately so the UI doesn't show a
-    // false "online" indicator for the first 30 s (M-01 from audit #3).
+    // Emit initial connectivity state so the UI doesn't show a false "online"
+    // indicator for the first 30 s (M-01 from audit #3).
     let initial_online = is_online(&client).await;
     let _ = app.emit("connectivity-changed", initial_online);
 
-    // Run sync and cleanup as independent loops so a slow sync cycle never
-    // delays the hourly cleanup (and vice-versa).
+    // Shared mutex prevents concurrent token refreshes: if two sync cycles
+    // overlap and both receive 401, only one calls the refresh endpoint — the
+    // second waits for the first result instead of double-rotating the token.
+    let refresh_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+    // Sync loop with exponential back-off on errors.
+    // Runs sync immediately on startup, then sleeps 30 s (or back-off) before
+    // each subsequent cycle — same first-run behaviour as interval-based tick.
     let pool_sync = pool.clone();
-    let client_sync = client.clone(); // cheap clone — Client is Arc-backed internally
+    let client_sync = client.clone();
     let app_sync = app.clone();
+    let refresh_lock_sync = refresh_lock.clone();
     tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(30));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Initialise from the startup ping so the first sync tick doesn't
-        // immediately re-emit connectivity-changed with the same value.
         let mut was_online = initial_online;
+        let mut consecutive_failures: u32 = 0;
         loop {
-            tick.tick().await;
-            sync_pending(&pool_sync, &client_sync, &app_sync, &mut was_online).await;
+            let had_error = sync_pending(
+                &pool_sync,
+                &client_sync,
+                &app_sync,
+                &mut was_online,
+                &refresh_lock_sync,
+            )
+            .await;
+
+            let delay_secs = if had_error {
+                consecutive_failures += 1;
+                // 30 * 2^n capped at 300 s (5 min).
+                let d = (30u64 * 2u64.pow(consecutive_failures.min(9))).min(300);
+                log::info!(
+                    "[sync] back-off {}s (consecutive_failures={})",
+                    d,
+                    consecutive_failures
+                );
+                d
+            } else {
+                consecutive_failures = 0;
+                30
+            };
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
     });
 
+    // Cleanup loop runs independently every hour so a slow sync cycle never
+    // delays cleanup (and vice-versa).
     let mut cleanup_tick = interval(Duration::from_secs(3600));
     cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -87,22 +123,36 @@ async fn try_refresh(pool: &SqlitePool) -> Option<String> {
     }
 }
 
-/// Fetches pending slots from DB and builds entries for bulk sync.
-/// ORDER BY id ensures stable ordering so response indices match slot_ids.
-async fn build_entries(pool: &SqlitePool) -> Result<(Vec<SyncTimeEntry>, Vec<i64>), sqlx::Error> {
+/// Fetches pending slots from DB.
+///
+/// Returns `(entries, slot_meta)` where `slot_meta[i] = (slot_id, started_at)`.
+/// `started_at` is used for result matching instead of positional indexing.
+///
+/// Filters:
+/// - `synced = 0 AND ended_at IS NOT NULL AND duration_secs > 0` — ready to sync
+/// - `sync_attempts < MAX_SYNC_ATTEMPTS` — skip permanently-failed slots
+///
+/// `app_usage` is capped at `MAX_APP_USAGE_PER_SLOT` rows to avoid oversized payloads.
+async fn build_entries(
+    pool: &SqlitePool,
+) -> Result<(Vec<SyncTimeEntry>, Vec<(i64, String)>), sqlx::Error> {
     let slots = sqlx::query_as::<_, (i64, String, String, String, i64, i64)>(
         r#"SELECT id, project_id, started_at, ended_at, duration_secs, activity_percent
            FROM time_slots
-           WHERE synced = 0 AND ended_at IS NOT NULL AND duration_secs > 0
+           WHERE synced = 0
+             AND ended_at IS NOT NULL
+             AND duration_secs > 0
+             AND sync_attempts < ?
            ORDER BY id
            LIMIT ?"#,
     )
+    .bind(MAX_SYNC_ATTEMPTS)
     .bind(SYNC_BATCH_LIMIT)
     .fetch_all(pool)
     .await?;
 
     let mut entries = Vec::with_capacity(slots.len());
-    let mut slot_ids = Vec::with_capacity(slots.len());
+    let mut slot_meta: Vec<(i64, String)> = Vec::with_capacity(slots.len());
 
     for (slot_id, project_id, started_at, ended_at, duration_secs, activity_percent) in &slots {
         let app_usages = match sqlx::query_as::<_, (String, String, Option<String>, i64, String)>(
@@ -132,39 +182,42 @@ async fn build_entries(pool: &SqlitePool) -> Result<(Vec<SyncTimeEntry>, Vec<i64
             activity_percent: *activity_percent,
             app_usage: app_usages
                 .into_iter()
+                .take(MAX_APP_USAGE_PER_SLOT)
                 .map(
-                    |(app_name, window_title, url, duration_seconds, started_at)| SyncAppUsage {
-                        app_name,
-                        window_title,
-                        url,
-                        duration_seconds,
-                        started_at,
+                    |(app_name, window_title, url, duration_seconds, au_started_at)| {
+                        SyncAppUsage {
+                            app_name,
+                            window_title,
+                            url,
+                            duration_seconds,
+                            started_at: au_started_at,
+                        }
                     },
                 )
                 .collect(),
         });
-        slot_ids.push(*slot_id);
+        slot_meta.push((*slot_id, started_at.clone()));
     }
 
-    Ok((entries, slot_ids))
+    Ok((entries, slot_meta))
 }
 
+/// Returns `true` when a retryable network/server error occurred (triggers
+/// exponential back-off in the caller).
+/// Returns `false` for expected non-error states: offline, nothing to sync,
+/// or a successful cycle.
 async fn sync_pending(
     pool: &SqlitePool,
     client: &reqwest::Client,
     app: &AppHandle,
     was_online: &mut bool,
-) {
-    // Check for a logged-in user first — if nobody is signed in there is
-    // nothing to sync and we avoid an unauthenticated ping to the API server
-    // on every 30-second cycle (BUG-A06 / privacy).
+    refresh_lock: &Arc<Mutex<()>>,
+) -> bool {
     let user = match User::get_current(pool).await {
         Ok(Some(u)) => u,
-        _ => return,
+        _ => return false,
     };
 
-    // Track connectivity changes and emit an event when the state flips.
-    // This lets the frontend show an offline indicator without polling.
     let online = is_online(client).await;
     if online != *was_online {
         let _ = app.emit("connectivity-changed", online);
@@ -172,52 +225,56 @@ async fn sync_pending(
     }
     if !online {
         log::info!("[sync] offline — skipping");
-        return;
+        return false;
     }
 
     let mut token = user.access_token.clone();
 
-    // ── Sync pending slots ────────────────────────────────────────────────
-    // Only attempt network sync when there are unsynced slots; orphan cleanup
-    // below always runs regardless so stale rows are never permanently stuck.
-    let (entries, slot_ids) = match build_entries(pool).await {
+    // ── Sync pending slots ────────────────────────────────────────────────────
+    let (entries, slot_meta) = match build_entries(pool).await {
         Ok(pair) => pair,
         Err(e) => {
             log::error!("[sync] failed to fetch slots: {}", e);
-            return;
+            return true;
         }
     };
 
-    if !slot_ids.is_empty() {
-        log::info!("[sync] syncing {} slots", slot_ids.len());
+    if !slot_meta.is_empty() {
+        log::info!("[sync] syncing {} slots", slot_meta.len());
 
-        // On 401: refresh token and re-fetch entries.
-        // Re-fetching is safe because ORDER BY id + same LIMIT returns the same rows.
-        // Critically, we also get a fresh slot_ids so indices stay consistent with
-        // the entries we send on retry.
-        let (response, final_slot_ids) = match sync_time_entries(client, &token, entries).await {
-            Ok(res) => (res, slot_ids),
+        let (response, final_meta) = match sync_time_entries(client, &token, entries).await {
+            Ok(res) => (res, slot_meta),
             Err(e) if e.contains("401") => {
                 log::info!("[sync] 401 — refreshing token");
-                match try_refresh(pool).await {
-                    Some(new_token) => {
-                        token = new_token;
-                        let (entries2, slot_ids2) = match build_entries(pool).await {
+                // Hold the lock only for the refresh call so a second concurrent
+                // cycle waits here instead of rotating the token a second time
+                // with an already-invalid refresh_token.
+                let new_token = {
+                    let _guard = refresh_lock.lock().await;
+                    try_refresh(pool).await
+                };
+                match new_token {
+                    Some(t) => {
+                        token = t;
+                        // Re-fetch entries after token rotation (ORDER BY id +
+                        // same LIMIT returns the same rows; slot_meta is rebuilt
+                        // so indices stay consistent).
+                        let (entries2, meta2) = match build_entries(pool).await {
                             Ok(pair) => pair,
                             Err(e) => {
                                 log::error!("[sync] rebuild after 401 failed: {}", e);
-                                return;
+                                return true;
                             }
                         };
                         match sync_time_entries(client, &token, entries2).await {
-                            Ok(res) => (res, slot_ids2),
+                            Ok(res) => (res, meta2),
                             Err(e) => {
                                 log::error!("[sync] retry failed: {}", e);
-                                return;
+                                return true;
                             }
                         }
                     }
-                    None => return,
+                    None => return true,
                 }
             }
             Err(e) => {
@@ -225,7 +282,7 @@ async fn sync_pending(
                     sentry::capture_message(&format!("Sync failed: {}", e), sentry::Level::Error);
                 }
                 log::error!("[sync] failed: {}", e);
-                return;
+                return true;
             }
         };
 
@@ -235,44 +292,97 @@ async fn sync_pending(
             response.failed
         );
 
-        // Mark synced slots, store remote_id, upload screenshots.
-        // response.entries is ordered the same as our request (backend preserves order).
-        for (i, result) in response.entries.iter().enumerate() {
-            if !result.synced || i >= final_slot_ids.len() {
-                continue;
-            }
-            let slot_id = final_slot_ids[i];
-            let remote_id = &result.id;
+        // ── Result matching ───────────────────────────────────────────────────
+        // Prefer matching by `started_at` to avoid writing the wrong remote_id
+        // if the server ever reorders response entries.
+        // Fall back to index-based matching when the server returns an older
+        // response format that doesn't include `startedAt` (detected by all
+        // results having an empty started_at field).
+        let all_have_started_at = response.entries.iter().all(|r| !r.started_at.is_empty());
 
-            let _ = sqlx::query("UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?")
-                .bind(remote_id)
+        if !all_have_started_at && !response.entries.is_empty() {
+            log::warn!("[sync] server did not return startedAt — falling back to index-based matching");
+        }
+
+        let result_map: Option<HashMap<&str, &SyncEntryResult>> = if all_have_started_at {
+            Some(
+                response
+                    .entries
+                    .iter()
+                    .map(|r| (r.started_at.as_str(), r))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        for (i, (slot_id, started_at)) in final_meta.iter().enumerate() {
+            let result: &SyncEntryResult = if let Some(ref map) = result_map {
+                // Safe path: match by started_at
+                match map.get(started_at.as_str()) {
+                    Some(r) => r,
+                    None => {
+                        log::warn!(
+                            "[sync] no result for slot {} (started_at={}), incrementing attempts",
+                            slot_id,
+                            started_at
+                        );
+                        let _ = sqlx::query(
+                            "UPDATE time_slots SET sync_attempts = sync_attempts + 1 WHERE id = ?",
+                        )
+                        .bind(slot_id)
+                        .execute(pool)
+                        .await;
+                        continue;
+                    }
+                }
+            } else {
+                // Legacy fallback: positional index
+                if i >= response.entries.len() {
+                    continue;
+                }
+                &response.entries[i]
+            };
+
+            if !result.synced {
+                log::warn!("[sync] server rejected slot {} — incrementing attempts", slot_id);
+                let _ = sqlx::query(
+                    "UPDATE time_slots SET sync_attempts = sync_attempts + 1 WHERE id = ?",
+                )
                 .bind(slot_id)
                 .execute(pool)
                 .await;
+                continue;
+            }
+
+            let _ =
+                sqlx::query("UPDATE time_slots SET synced = 1, remote_id = ? WHERE id = ?")
+                    .bind(&result.id)
+                    .bind(slot_id)
+                    .execute(pool)
+                    .await;
 
             let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE time_slot_id = ?")
                 .bind(slot_id)
                 .execute(pool)
                 .await;
 
-            upload_slot_screenshots(pool, client, &token, slot_id, remote_id).await;
+            upload_slot_screenshots(pool, client, &token, *slot_id, &result.id).await;
 
-            log::info!("[sync] slot {} → remote {} ✓", slot_id, remote_id);
+            log::info!("[sync] slot {} → remote {} ✓", slot_id, result.id);
         }
     }
 
-    // ── Orphan cleanup (always runs, even when no new slots were synced) ──
-    // This catches app_usage/screenshots that were written after their slot
-    // was already synced — which previously got stuck forever because this
-    // block was only reachable when slot_ids was non-empty.
+    // ── Orphan cleanup (always runs, even when no new slots were synced) ──────
 
-    // Invalid app_usage: rows with empty app_name are skipped during sync but
-    // never marked synced, blocking all future cycles. Mark them done now.
-    let _ = sqlx::query("UPDATE app_usage SET synced = 1 WHERE synced = 0 AND trim(app_name) = ''")
-        .execute(pool)
-        .await;
+    // Invalid app_usage with empty app_name: skipped during sync but never
+    // marked synced — mark them done so they stop blocking sync cycles.
+    let _ =
+        sqlx::query("UPDATE app_usage SET synced = 1 WHERE synced = 0 AND trim(app_name) = ''")
+            .execute(pool)
+            .await;
 
-    // Orphan app_usage: mark synced so they don't block future sync cycles.
+    // app_usage rows whose parent slot is already synced: mark done.
     let orphan = sqlx::query(
         "UPDATE app_usage SET synced = 1 \
          WHERE synced = 0 \
@@ -292,14 +402,19 @@ async fn sync_pending(
         _ => {}
     }
 
-    // Orphan screenshots: retry upload for screenshots whose slot is already synced.
-    // remote_id is stored in time_slots so we can retry without re-syncing the entry.
+    // Retry orphan screenshots whose parent slot is already synced but the
+    // screenshot upload was deferred or failed. Excludes rows that have already
+    // exceeded MAX_SYNC_ATTEMPTS.
     let orphan_screenshots = sqlx::query_as::<_, (i64, String, String, i64)>(
         r#"SELECT s.id, s.file_path, t.remote_id, t.activity_percent
            FROM screenshots s
            JOIN time_slots t ON t.id = s.time_slot_id
-           WHERE s.synced = 0 AND t.synced = 1 AND t.remote_id IS NOT NULL"#,
+           WHERE s.synced = 0
+             AND s.sync_attempts < ?
+             AND t.synced = 1
+             AND t.remote_id IS NOT NULL"#,
     )
+    .bind(MAX_SYNC_ATTEMPTS)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -310,28 +425,107 @@ async fn sync_pending(
             orphan_screenshots.len()
         );
         for (screenshot_id, file_path, remote_id, activity_percent) in orphan_screenshots {
-            match upload_screenshot(client, &token, &remote_id, &file_path, activity_percent).await
-            {
-                Ok(_) => {
-                    log::info!("[sync] orphan screenshot uploaded: {}", file_path);
-                    let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
-                        .bind(screenshot_id)
-                        .execute(pool)
-                        .await;
-                    match tokio::fs::remove_file(&file_path).await {
-                        Ok(_) => log::info!("[sync] orphan screenshot file deleted: {}", file_path),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => log::warn!("[sync] failed to remove orphan screenshot file {}: {}", file_path, e),
-                    }
-                }
-                Err(e) => log::warn!("[sync] orphan screenshot failed: {}", e),
-            }
+            handle_screenshot_upload(
+                pool,
+                client,
+                &token,
+                screenshot_id,
+                &file_path,
+                &remote_id,
+                activity_percent,
+            )
+            .await;
         }
     }
 
-    // Notify the frontend that a full sync cycle completed so it can
-    // refresh "Last updated at" in the footer.
     let _ = app.emit("sync-completed", Utc::now().to_rfc3339());
+    false
+}
+
+/// Returns `true` if the error string indicates the local file is missing.
+fn is_file_not_found(e: &str) -> bool {
+    e.contains("No such file") || e.contains("os error 2") || e.contains("NotFound")
+}
+
+/// Uploads a single screenshot, handling all error cases:
+/// - File missing: marks `synced = 1` immediately — nothing to upload.
+/// - Other errors: increments `sync_attempts`; permanently abandons
+///   (marks `synced = 1`) after `MAX_SYNC_ATTEMPTS` failures.
+/// - Success: marks `synced = 1` and deletes the local file.
+async fn handle_screenshot_upload(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    token: &str,
+    screenshot_id: i64,
+    file_path: &str,
+    remote_id: &str,
+    activity_percent: i64,
+) {
+    match upload_screenshot(client, token, remote_id, file_path, activity_percent).await {
+        Ok(_) => {
+            log::info!("[sync] screenshot uploaded: {}", file_path);
+            let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
+                .bind(screenshot_id)
+                .execute(pool)
+                .await;
+            match tokio::fs::remove_file(file_path).await {
+                Ok(_) => log::info!("[sync] screenshot file deleted: {}", file_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!(
+                    "[sync] failed to remove screenshot file {}: {}",
+                    file_path,
+                    e
+                ),
+            }
+        }
+        Err(ref e) if is_file_not_found(e) => {
+            // File was deleted externally — mark done so we stop retrying.
+            log::warn!(
+                "[sync] screenshot file missing, marking done: {}",
+                file_path
+            );
+            let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
+                .bind(screenshot_id)
+                .execute(pool)
+                .await;
+        }
+        Err(e) => {
+            sentry::capture_message(
+                &format!("Screenshot upload failed: {}", e),
+                sentry::Level::Warning,
+            );
+            log::warn!("[sync] screenshot failed: {}", e);
+
+            // Increment attempts and permanently abandon if limit reached.
+            let _ = sqlx::query(
+                "UPDATE screenshots SET sync_attempts = sync_attempts + 1 WHERE id = ?",
+            )
+            .bind(screenshot_id)
+            .execute(pool)
+            .await;
+
+            let attempts = sqlx::query_as::<_, (i64,)>(
+                "SELECT sync_attempts FROM screenshots WHERE id = ?",
+            )
+            .bind(screenshot_id)
+            .fetch_one(pool)
+            .await
+            .map(|(a,)| a)
+            .unwrap_or(0);
+
+            if attempts >= MAX_SYNC_ATTEMPTS {
+                log::warn!(
+                    "[sync] screenshot permanently abandoned after {} attempts: {}",
+                    attempts,
+                    file_path
+                );
+                let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
+                    .bind(screenshot_id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+    }
 }
 
 async fn upload_slot_screenshots(
@@ -353,44 +547,31 @@ async fn upload_slot_screenshots(
     .unwrap_or_default();
 
     for (screenshot_id, file_path, activity_percent) in screenshots {
-        match upload_screenshot(client, token, remote_id, &file_path, activity_percent).await {
-            Ok(_) => {
-                log::info!("[sync] screenshot uploaded: {}", file_path);
-                let _ = sqlx::query("UPDATE screenshots SET synced = 1 WHERE id = ?")
-                    .bind(screenshot_id)
-                    .execute(pool)
-                    .await;
-                // Delete the local file immediately — no reason to keep it on
-                // disk once the server has it. Cleanup happens here, not in the
-                // hourly cleanup cycle, so disk space is freed right away.
-                match tokio::fs::remove_file(&file_path).await {
-                    Ok(_) => log::info!("[sync] screenshot file deleted after upload: {}", file_path),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => log::warn!("[sync] failed to remove screenshot file {}: {}", file_path, e),
-                }
-            }
-            Err(e) => {
-                sentry::capture_message(
-                    &format!("Screenshot upload failed: {}", e),
-                    sentry::Level::Warning,
-                );
-                log::warn!("[sync] screenshot failed: {}", e);
-            }
-        }
+        handle_screenshot_upload(
+            pool,
+            client,
+            token,
+            screenshot_id,
+            &file_path,
+            remote_id,
+            activity_percent,
+        )
+        .await;
     }
 }
 
 async fn cleanup_old_data(pool: &SqlitePool) {
-    // Screenshot files are deleted immediately after a successful upload, so
-    // there is no filesystem work to do here — only DB record cleanup.
-
-    // Remove time_slots that were synced more than 24 hours ago.
-    // Rows are kept for 24 h so that today_secs and recent history remain
-    // queryable by the frontend even after the data is on the server.
+    // Delete time_slots synced more than 24 h ago — but only if ALL their
+    // screenshots are also synced. Deleting a slot before its screenshots
+    // upload would lose the JOIN in the orphan-retry query, making those
+    // screenshots permanently invisible to the sync pipeline (data loss).
     let slots_result = sqlx::query(
         r#"DELETE FROM time_slots
            WHERE synced = 1
-           AND datetime(ended_at) < datetime('now', '-24 hours')"#,
+             AND datetime(ended_at) < datetime('now', '-24 hours')
+             AND id NOT IN (
+                 SELECT DISTINCT time_slot_id FROM screenshots WHERE synced = 0
+             )"#,
     )
     .execute(pool)
     .await;
@@ -403,8 +584,30 @@ async fn cleanup_old_data(pool: &SqlitePool) {
         _ => {}
     }
 
-    // Remove app_usage rows whose parent time_slot was just deleted (or was
-    // already missing from a previous cycle).
+    // Permanently-failed slots (sync_attempts >= MAX_SYNC_ATTEMPTS) are never
+    // cleaned by the normal path (synced stays 0). Delete them after 7 days.
+    let failed_result = sqlx::query(
+        r#"DELETE FROM time_slots
+           WHERE synced = 0
+             AND sync_attempts >= ?
+             AND datetime(ended_at) < datetime('now', '-7 days')"#,
+    )
+    .bind(MAX_SYNC_ATTEMPTS)
+    .execute(pool)
+    .await;
+
+    match failed_result {
+        Ok(r) if r.rows_affected() > 0 => {
+            log::info!(
+                "[cleanup] deleted {} permanently-failed time_slots",
+                r.rows_affected()
+            );
+        }
+        Err(e) => log::warn!("[cleanup] failed to delete failed time_slots: {}", e),
+        _ => {}
+    }
+
+    // Remove app_usage rows whose parent time_slot was deleted.
     let dangling_usage = sqlx::query(
         "DELETE FROM app_usage WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
     )
@@ -423,8 +626,6 @@ async fn cleanup_old_data(pool: &SqlitePool) {
     }
 
     // Remove screenshot records whose parent time_slot no longer exists.
-    // Files are already gone (deleted after upload); this clears any lingering
-    // DB rows so the orphan-retry query never re-attempts a missing file.
     let orphan_ss = sqlx::query(
         "DELETE FROM screenshots WHERE time_slot_id NOT IN (SELECT id FROM time_slots)",
     )

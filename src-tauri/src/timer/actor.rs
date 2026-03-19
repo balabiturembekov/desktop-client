@@ -10,10 +10,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
+use crate::api::models::auth::TrackingSettings;
 use crate::timer::models::TimerCommand;
 use crate::tracker::models::ActivityState;
-
-const IDLE_TIMEOUT_SECS: i64 = 300;
 const CHUNK_SECS: i64 = 600; // 10 минут
 const PROGRESS_SAVE_EVERY_SECS: i64 = 60; // обновлять stub каждую минуту
 /// Gap between consecutive 1-second ticks that indicates a system suspend/resume.
@@ -205,7 +204,7 @@ fn open_idle_window(app: &AppHandle, idle_secs: u64) {
 
     match WebviewWindowBuilder::new(app, "idle", WebviewUrl::App(url.into()))
         .title("Hubnity")
-        .inner_size(320.0, 260.0)
+        .inner_size(320.0, 300.0)
         .resizable(false)
         .decorations(false)
         .always_on_top(false) // UX-14: do not force idle window above all other apps
@@ -228,6 +227,7 @@ pub async fn time_actor(
     is_running_flag: Arc<AtomicBool>,
     activity: ActivityState,
     current_slot_id: Arc<Mutex<Option<i64>>>,
+    settings: Arc<Mutex<TrackingSettings>>,
 ) {
     let mut running = false;
     let mut chunk_started_at: Option<DateTime<Utc>> = None;
@@ -406,6 +406,9 @@ pub async fn time_actor(
             // Tick fires when running OR when idle window is open (to detect
             // sleep/wake while the user is looking at the idle dialog).
             _ = tick.tick(), if running || idle_window_opened => {
+                // ── Read current tracking settings (cheap clone) ──────────────
+                let s = settings.lock().await.clone();
+
                 // ── Sleep/wake detection ──────────────────────────────────────
                 // Compute wall-clock time since the previous tick. On macOS,
                 // tokio's monotonic interval advances during system sleep, so the
@@ -418,6 +421,11 @@ pub async fn time_actor(
                 last_tick_at = now_utc;
 
                 if real_elapsed > SLEEP_DETECT_SECS {
+                    if !s.idle_detection_enabled {
+                        // Idle detection disabled — treat sleep time as active.
+                        // Do not open the idle window; just let the timer continue.
+                        continue;
+                    }
                     if !running && idle_window_opened {
                         // Machine slept while the idle window was already open.
                         // Recompute total idle time from the original last-activity
@@ -549,13 +557,14 @@ pub async fn time_actor(
                         .or(Some(Utc::now()));
                 }
 
+                if s.idle_detection_enabled {
                 if let Some(last_active) = last_activity_at {
                     // .max(0): if the system clock is adjusted backward last_active
                     // can land in the future, making the difference negative. Without
                     // the clamp, idle_secs < 0 means the idle check never fires and
                     // the timer runs forever without auto-saving (BUG-A04).
                     let idle_secs = (Utc::now() - last_active).num_seconds().max(0);
-                    if idle_secs >= IDLE_TIMEOUT_SECS && !idle_window_opened {
+                    if idle_secs >= s.idle_timeout_seconds as i64 && !idle_window_opened {
                         log::info!("[timer] idle: {} secs", idle_secs);
                         running = false;
                         idle_window_opened = true;
@@ -595,6 +604,7 @@ pub async fn time_actor(
                         continue;
                     }
                 }
+                } // end if s.idle_detection_enabled
 
                 // Прогресс-сейв каждые 60 секунд: UPDATE stub in-place
                 chunk_elapsed_secs += 1;

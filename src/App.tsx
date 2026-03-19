@@ -173,6 +173,21 @@ export default function App() {
     return () => { cancelled = true; unlisten?.(); };
   }, []);
 
+  // Re-fetch user if backend backfilled org_name for an existing session
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen("user-updated", () => {
+      invoke<User | null>("cmd_get_current_user")
+        .then((u) => { if (!cancelled) setUser(u); })
+        .catch(() => {});
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
   // BUG-F10: catch and display update errors
   const handleUpdate = async () => {
     setUpdating(true);

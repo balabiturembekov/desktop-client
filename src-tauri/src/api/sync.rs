@@ -42,6 +42,13 @@ pub struct SyncTimeEntriesRequest {
 pub struct SyncEntryResult {
     pub id: String,
     pub synced: bool,
+    /// Echoed back by the server so we can match results by content instead of
+    /// by positional index (index-based matching risks writing the wrong
+    /// remote_id if the server ever reorders entries).
+    /// Defaults to empty string on older server versions — callers detect this
+    /// and fall back to index-based matching with a warning.
+    #[serde(rename = "startedAt", default)]
+    pub started_at: String,
 }
 
 #[derive(Debug, Deserialize)]

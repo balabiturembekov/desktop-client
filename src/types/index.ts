@@ -7,6 +7,8 @@ export interface User {
   access_token: string;
   refresh_token: string;
   created_at: string;
+  org_id: string | null;
+  org_name: string | null;
 }
 
 export interface Project {

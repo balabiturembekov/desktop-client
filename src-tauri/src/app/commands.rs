@@ -3,11 +3,15 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 
-use crate::api::auth::{fetch_projects, login};
+use crate::api::auth::{fetch_organizations, fetch_projects, get_effective_settings, login};
+use crate::api::models::auth::TrackingSettings;
 use crate::db::models::{project::Project, user::User};
 use crate::timer::models::{TimerCommand, TimerState};
+
+use std::sync::Arc;
 
 /// Managed state holding the tray menu item that toggles Start/Stop.
 /// `last_tooltip` caches the last value written to the tray so we can skip
@@ -39,6 +43,11 @@ pub async fn cmd_login(
     pool: State<'_, SqlitePool>,
 ) -> Result<User, String> {
     let res = login(&email, &password).await?;
+    let (org_id, org_name) = fetch_organizations(&res.access_token)
+        .await
+        .ok()
+        .and_then(|mut orgs| orgs.drain(..).next().map(|o| (Some(o.id), Some(o.name))))
+        .unwrap_or((None, None));
     let user = User {
         id: 0,
         remote_id: res.user.id,
@@ -49,6 +58,8 @@ pub async fn cmd_login(
         access_token: res.access_token.clone(),
         refresh_token: res.refresh_token.clone(),
         created_at: res.user.created_at,
+        org_id,
+        org_name,
     };
     User::save(&pool, &user).await.map_err(|e| e.to_string())?;
 
@@ -75,7 +86,29 @@ pub async fn cmd_login(
         log::info!("[autostart] enabled at login");
     }
 
+    // Load tracking settings immediately after login so the actors use
+    // org/member-specific values from the very first timer start.
+    if let Some(ref org_id) = user.org_id {
+        let new_settings =
+            get_effective_settings(&user.access_token, org_id, &user.remote_id).await;
+        log_tracking_settings(&new_settings);
+        if let Some(state) = app.try_state::<Arc<Mutex<TrackingSettings>>>() {
+            *state.lock().await = new_settings;
+        }
+    }
+
     Ok(user)
+}
+
+fn log_tracking_settings(s: &TrackingSettings) {
+    log::info!(
+        "[settings] screenshot interval: {}min, idle: {}s, app_tracking: {}, screenshots: {}, idle_detection: {}",
+        s.screenshot_interval_minutes,
+        s.idle_timeout_seconds,
+        s.app_tracking_enabled,
+        s.screenshots_enabled,
+        s.idle_detection_enabled,
+    );
 }
 
 #[tauri::command]

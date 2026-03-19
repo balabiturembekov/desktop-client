@@ -7,6 +7,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 
+use crate::api::models::auth::TrackingSettings;
 use crate::app_tracker::models::AppKey;
 
 const POLL_SECS: u64 = 5;
@@ -26,6 +27,7 @@ pub async fn app_tracker_actor(
     pool: SqlitePool,
     is_running: Arc<std::sync::atomic::AtomicBool>,
     current_slot_id: Arc<Mutex<Option<i64>>>,
+    settings: Arc<Mutex<TrackingSettings>>,
 ) {
     log::info!("[app_tracker] actor started");
 
@@ -73,6 +75,12 @@ pub async fn app_tracker_actor(
             Some(id) if running => id,
             _ => continue,
         };
+
+        // Respect app_tracking_enabled setting (checked after flush so pending
+        // data from before a settings change is still written to the DB).
+        if !settings.lock().await.app_tracking_enabled {
+            continue;
+        }
 
         // Sample active window on a blocking OS thread.
         let result = tokio::task::spawn_blocking(active_win_pos_rs::get_active_window).await;

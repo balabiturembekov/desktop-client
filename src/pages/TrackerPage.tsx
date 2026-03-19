@@ -329,7 +329,12 @@ export default function TrackerPage({ user, onLogout, showUpdateBanner }: Props)
 
         {/* Project selector */}
         <div className="w-full">
-          <label className="block text-xs text-[#555] mb-1.5 uppercase tracking-wider">Project</label>
+          <div className="flex items-baseline justify-between mb-1.5">
+            <label className="text-xs text-[#555] uppercase tracking-wider">Project</label>
+            {user.org_name && (
+              <span className="text-[10px] text-[#555] truncate max-w-[160px]">{user.org_name}</span>
+            )}
+          </div>
           {projectsError ? (
             <div className="rounded-lg bg-[#1a1a1a] border border-red-900 px-3 py-2.5 flex items-center justify-between gap-3">
               <span className="text-xs text-red-400">
@@ -426,14 +431,8 @@ export default function TrackerPage({ user, onLogout, showUpdateBanner }: Props)
             <span className="text-xs text-red-500">Offline</span>
           </div>
         )}
-        {/* UX-18: title on truncated project name */}
-        {selectedProject && (
-          <span
-            title={selectedProject.name}
-            className="text-xs text-[#444] truncate max-w-[150px]"
-          >
-            {selectedProject.name}
-          </span>
+        {user.org_name && (
+          <span className="text-xs text-[#444] truncate max-w-[180px]">{user.org_name}</span>
         )}
       </div>
 

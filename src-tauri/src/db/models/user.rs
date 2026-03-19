@@ -12,20 +12,27 @@ pub struct User {
     pub access_token: String,
     pub refresh_token: String,
     pub created_at: String,
+    /// Organization ID used to fetch tracking settings. NULL for users who
+    /// logged in before migration 008 (they get defaults until next login).
+    pub org_id: Option<String>,
+    /// Human-readable organization name shown in the UI.
+    pub org_name: Option<String>,
 }
 
 impl User {
     pub async fn save(pool: &SqlitePool, user: &User) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO users (remote_id, email, name, avatar, role, access_token, refresh_token, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (remote_id, email, name, avatar, role, access_token, refresh_token, created_at, org_id, org_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(remote_id) DO UPDATE SET
                 access_token  = excluded.access_token,
                 refresh_token = excluded.refresh_token,
                 email         = excluded.email,
                 name          = excluded.name,
-                avatar        = excluded.avatar
+                avatar        = excluded.avatar,
+                org_id        = excluded.org_id,
+                org_name      = excluded.org_name
             "#,
         )
         .bind(&user.remote_id)
@@ -36,6 +43,8 @@ impl User {
         .bind(&user.access_token)
         .bind(&user.refresh_token)
         .bind(&user.created_at)
+        .bind(&user.org_id)
+        .bind(&user.org_name)
         .execute(pool)
         .await?;
         Ok(())

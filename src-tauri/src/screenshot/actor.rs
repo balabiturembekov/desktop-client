@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
+use crate::api::models::auth::TrackingSettings;
 use crate::screenshot::capture::capture_screenshot;
 
 /// Returns true if the process has Screen Recording permission on macOS.
@@ -26,8 +27,6 @@ fn is_screen_recording_trusted() -> bool {
     true
 }
 
-/// Length of one tracking chunk in seconds.
-const CHUNK_SECS: u64 = 600;
 /// Poll interval — how often we check elapsed time and timer state.
 const POLL_SECS: u64 = 1;
 /// Minimum elapsed seconds before a stop-triggered screenshot is taken.
@@ -35,23 +34,22 @@ const STOP_SHOT_MIN_SECS: u64 = 30;
 /// Number of equal windows the chunk is divided into (one shot per window).
 const WINDOWS: u64 = 3;
 
-/// Plans one screenshot offset per window, distributed uniformly across the chunk.
+/// Plans one screenshot offset per window, distributed uniformly across `chunk_secs`.
 ///
-/// The chunk is split into WINDOWS equal slices ([0,200), [200,400), [400,600)).
-/// One random second is chosen inside each slice, so screenshots are spread
-/// across the whole chunk rather than clustering at one end.
-fn plan_chunk() -> Vec<u64> {
+/// The chunk is split into WINDOWS equal slices. One random second is chosen
+/// inside each slice so screenshots are spread evenly rather than clustering.
+fn plan_chunk(chunk_secs: u64) -> Vec<u64> {
     let mut rng = rand::thread_rng();
-    let window_secs = CHUNK_SECS / WINDOWS; // 200s each
+    let window_secs = (chunk_secs / WINDOWS).max(1);
     let offsets: Vec<u64> = (0..WINDOWS)
         .map(|w| {
             let lo = w * window_secs;
-            let hi = lo + window_secs; // exclusive upper bound
-            rng.gen_range(lo..hi)
+            let hi = (lo + window_secs).min(chunk_secs); // exclusive upper bound
+            if hi > lo { rng.gen_range(lo..hi) } else { lo }
         })
         .collect();
     // offsets are already in ascending order (one per window, windows non-overlapping)
-    log::info!("[screenshot] plan_chunk: {:?}", offsets);
+    log::info!("[screenshot] plan_chunk({}s): {:?}", chunk_secs, offsets);
     offsets
 }
 
@@ -146,12 +144,15 @@ pub async fn screenshot_actor(
     screenshots_dir: PathBuf,
     is_running: Arc<AtomicBool>,
     current_slot_id: Arc<Mutex<Option<i64>>>,
+    settings: Arc<Mutex<TrackingSettings>>,
 ) {
     let mut tick = interval(Duration::from_secs(POLL_SECS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Elapsed seconds since the start of the current chunk.
     let mut chunk_elapsed: u64 = 0;
+    // Chunk size in seconds used when the current plan was created.
+    let mut current_chunk_secs: u64 = settings.lock().await.screenshot_interval_minutes * 60;
     // Planned screenshot offsets for the current chunk (one per window, ascending).
     let mut scheduled: Vec<u64> = vec![];
     // Index into `scheduled` — points to the next shot not yet taken.
@@ -173,24 +174,28 @@ pub async fn screenshot_actor(
         tick.tick().await;
 
         let running = is_running.load(Ordering::Relaxed);
+        // Read current settings once per tick (cheap clone).
+        let s = settings.lock().await.clone();
 
         // ── State transitions ─────────────────────────────────────────────
         if running && !was_running {
-            // Timer started / resumed → plan a fresh chunk.
+            // Timer started / resumed → plan a fresh chunk using current settings.
+            current_chunk_secs = s.screenshot_interval_minutes * 60;
             chunk_elapsed = 0;
-            scheduled = plan_chunk();
+            scheduled = plan_chunk(current_chunk_secs);
             next_shot = 0;
             shot_taken_this_chunk = false;
             log::info!(
-                "[screenshot] planned {} screenshot(s) at {:?}s",
+                "[screenshot] planned {} screenshot(s) at {:?}s (chunk={}s)",
                 scheduled.len(),
-                scheduled
+                scheduled,
+                current_chunk_secs,
             );
         } else if !running && was_running {
             // Timer stopped or went idle.
-            // Take a stop-shot if at least STOP_SHOT_MIN_SECS have elapsed
-            // and no screenshot was taken yet in this chunk.
-            if chunk_elapsed >= STOP_SHOT_MIN_SECS && !shot_taken_this_chunk {
+            // Take a stop-shot if screenshots are enabled, at least STOP_SHOT_MIN_SECS
+            // have elapsed, and no screenshot was taken yet in this chunk.
+            if s.screenshots_enabled && chunk_elapsed >= STOP_SHOT_MIN_SECS && !shot_taken_this_chunk {
                 let slot_id = *current_slot_id.lock().await;
                 if let Some(slot_id) = slot_id {
                     log::info!(
@@ -216,19 +221,27 @@ pub async fn screenshot_actor(
         chunk_elapsed += POLL_SECS;
 
         // ── Chunk rollover ────────────────────────────────────────────────
-        if chunk_elapsed >= CHUNK_SECS {
+        if chunk_elapsed >= current_chunk_secs {
+            // Re-read chunk size in case settings changed since the last plan.
+            current_chunk_secs = s.screenshot_interval_minutes * 60;
             chunk_elapsed = 0;
-            scheduled = plan_chunk();
+            scheduled = plan_chunk(current_chunk_secs);
             next_shot = 0;
             shot_taken_this_chunk = false;
             log::info!(
-                "[screenshot] chunk rollover — planned {} screenshot(s) at {:?}s",
+                "[screenshot] chunk rollover — planned {} screenshot(s) at {:?}s (chunk={}s)",
                 scheduled.len(),
-                scheduled
+                scheduled,
+                current_chunk_secs,
             );
         }
 
         // ── Fire scheduled shots ──────────────────────────────────────────
+        // Skip entirely if screenshots are disabled in tracking settings.
+        if !s.screenshots_enabled {
+            continue;
+        }
+
         while next_shot < scheduled.len() && chunk_elapsed >= scheduled[next_shot] {
             let offset = scheduled[next_shot];
             next_shot += 1;

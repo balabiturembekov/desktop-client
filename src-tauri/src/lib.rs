@@ -21,6 +21,8 @@ use app::commands::{
     cmd_resume_after_idle, cmd_stop_after_idle, cmd_stop_and_quit, cmd_update_tray_status,
     CloseRequestedPayload, TrayState,
 };
+use api::auth::get_effective_settings;
+use api::models::auth::TrackingSettings;
 use app_tracker::actor::app_tracker_actor;
 use db::init_db;
 use screenshot::actor::screenshot_actor;
@@ -94,6 +96,13 @@ pub fn run() {
             let activity_state = ActivityState::new();
             let current_slot_id: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
 
+            // Tracking settings shared across all actors.
+            // Initialised with hardcoded defaults; overwritten after login and
+            // refreshed every 30 minutes from the org/member settings endpoints.
+            let tracking_settings: Arc<Mutex<TrackingSettings>> =
+                Arc::new(Mutex::new(TrackingSettings::default()));
+            app.manage(tracking_settings.clone());
+
             let (tx, rx) = mpsc::channel(8);
             tauri::async_runtime::spawn(time_actor(
                 rx,
@@ -102,6 +111,7 @@ pub fn run() {
                 is_running.clone(),
                 activity_state.clone(),
                 current_slot_id.clone(),
+                tracking_settings.clone(),
             ));
             app.manage(TimerState {
                 sender: tx,
@@ -149,17 +159,106 @@ pub fn run() {
                 screenshots_dir,
                 is_running.clone(),
                 current_slot_id.clone(),
+                tracking_settings.clone(),
             ));
 
             tauri::async_runtime::spawn(app_tracker_actor(
                 pool.clone(),
                 is_running.clone(),
                 current_slot_id,
+                tracking_settings.clone(),
             ));
 
             tauri::async_runtime::spawn(sync_actor(pool.clone(), handle.clone()));
 
             app.manage(pool);
+
+            // ── Background tracking-settings refresh (every 30 minutes) ──────
+            // Reads the current user from the DB, then hits the org/member
+            // settings endpoints and writes the result into the shared Arc so
+            // all actors pick up the new values on their next tick.
+            {
+                let refresh_handle = handle.clone();
+                let refresh_settings = tracking_settings.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(1800));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        interval.tick().await;
+
+                        let pool = match refresh_handle.try_state::<sqlx::SqlitePool>() {
+                            Some(p) => p.inner().clone(),
+                            None => continue,
+                        };
+
+                        let user =
+                            match db::models::user::User::get_current(&pool).await {
+                                Ok(Some(u)) => u,
+                                _ => continue,
+                            };
+
+                        let Some(org_id) = user.org_id else { continue };
+
+                        log::info!("[settings] refreshing tracking settings for org {}", org_id);
+                        let new_settings = get_effective_settings(
+                            &user.access_token,
+                            &org_id,
+                            &user.remote_id,
+                        )
+                        .await;
+
+                        log::info!(
+                            "[settings] screenshot interval: {}min, idle: {}s, \
+                             app_tracking: {}, screenshots: {}, idle_detection: {}",
+                            new_settings.screenshot_interval_minutes,
+                            new_settings.idle_timeout_seconds,
+                            new_settings.app_tracking_enabled,
+                            new_settings.screenshots_enabled,
+                            new_settings.idle_detection_enabled,
+                        );
+
+                        *refresh_settings.lock().await = new_settings;
+                    }
+                });
+            }
+
+            // Backfill org_id / org_name for users who logged in before migration 008/009.
+            // Runs once at startup; emits "user-updated" so the frontend re-fetches the user.
+            {
+                let org_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let pool = match org_handle.try_state::<sqlx::SqlitePool>() {
+                        Some(p) => p.inner().clone(),
+                        None => return,
+                    };
+                    let user = match db::models::user::User::get_current(&pool).await {
+                        Ok(Some(u)) => u,
+                        _ => return,
+                    };
+                    if user.org_name.is_some() {
+                        return; // already populated
+                    }
+                    let orgs = match api::auth::fetch_organizations(&user.access_token).await {
+                        Ok(o) if !o.is_empty() => o,
+                        _ => return,
+                    };
+                    let updated = db::models::user::User {
+                        org_id: Some(orgs[0].id.clone()),
+                        org_name: Some(orgs[0].name.clone()),
+                        ..user
+                    };
+                    if db::models::user::User::save(&pool, &updated).await.is_ok() {
+                        log::info!(
+                            "[org] backfilled org_name={:?} for existing user",
+                            updated.org_name
+                        );
+                        let _ = org_handle.emit("user-updated", ());
+                    }
+                });
+            }
 
             // Emit "permissions-required" at startup if Accessibility is not granted.
             // Deferred by 500ms so the webview's event listeners are ready to receive it.
