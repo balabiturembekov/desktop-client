@@ -95,8 +95,14 @@ async fn save_chunk(
     match sqlx::query(
         r#"INSERT INTO time_slots
         (project_id, started_at, ended_at, duration_secs, activity_percent, synced)
-        VALUES (?, ?, ?, ?, ?, 0)"#,
+        VALUES (?, ?, ?, ?, ?, ?)"#,
     )
+    .bind(project_id)
+    .bind(&started_at_str)
+    .bind(&ended_at_str)
+    .bind(duration_secs)
+    .bind(percent)
+    .bind(if duration_secs == 0 { 2 } else { 0 })
     .bind(project_id)
     .bind(&started_at_str)
     .bind(&ended_at_str)
@@ -150,6 +156,11 @@ async fn finalize_slot(
     }
     if let Some(sid) = stub_id {
         update_slot(pool, sid, started_at, ended_at, activity).await;
+        // Mark as ready for sync
+        let _ = sqlx::query("UPDATE time_slots SET synced = 0 WHERE id = ?")
+            .bind(sid)
+            .execute(pool)
+            .await;
     } else {
         log::warn!("[timer] stub slot missing — falling back to direct INSERT");
         save_chunk(pool, project_id, started_at, ended_at, activity).await;
@@ -293,6 +304,7 @@ pub async fn time_actor(
                             // Создаём stub-слот сразу: app_tracker получает slot_id с первой секунды.
                             // Stub обновляется in-place каждые 60с и финализируется на Stop —
                             // никогда не дублируется новым INSERT.
+                            // Set synced = 2 to mark as stub slot, preventing premature sync
                             if let Some(sid) = save_chunk(&pool, &project_id, start_time, start_time, &activity).await {
                                 stub_slot_id = Some(sid);
                                 *current_slot_id.lock().await = Some(sid);
