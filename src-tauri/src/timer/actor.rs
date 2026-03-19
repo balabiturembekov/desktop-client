@@ -638,12 +638,15 @@ pub async fn time_actor(
                             *current_slot_id.lock().await = Some(new_sid);
                         }
 
+                        // Начинаем новый чанк с текущего времени
                         chunk_started_at = Some(ended_at);
+                        // Сбрасываем счётчики
                         chunk_elapsed_secs = 0;
                         last_progress_save = 0;
                         activity.active_seconds.store(0, Ordering::Relaxed);
                         activity.total_seconds.store(0, Ordering::Relaxed);
 
+                        // Обновляем кеш общего времени за сегодня
                         today_secs_cache = get_today_secs(&pool).await;
                     }
                 }
