@@ -26,11 +26,6 @@ pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
         .build()
         .expect("failed to build HTTP client");
 
-    // Emit initial connectivity state so the UI doesn't show a false "online"
-    // indicator for the first 30 s (M-01 from audit #3).
-    let initial_online = is_online(&client).await;
-    let _ = app.emit("connectivity-changed", initial_online);
-
     // Shared mutex prevents concurrent token refreshes: if two sync cycles
     // overlap and both receive 401, only one calls the refresh endpoint — the
     // second waits for the first result instead of double-rotating the token.
@@ -44,6 +39,11 @@ pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
     let app_sync = app.clone();
     let refresh_lock_sync = refresh_lock.clone();
     tokio::spawn(async move {
+        // Emit initial connectivity state so the UI doesn't show a false "online"
+        // indicator for the first 30 s (M-01 from audit #3).
+        let initial_online = is_online(&client_sync).await;
+        let _ = app_sync.emit("connectivity-changed", initial_online);
+
         let mut was_online = initial_online;
         let mut consecutive_failures: u32 = 0;
         loop {
@@ -76,12 +76,15 @@ pub async fn sync_actor(pool: SqlitePool, app: AppHandle) {
 
     // Cleanup loop runs independently every hour so a slow sync cycle never
     // delays cleanup (and vice-versa).
-    let mut cleanup_tick = interval(Duration::from_secs(3600));
-    cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        cleanup_tick.tick().await;
-        cleanup_old_data(&pool).await;
-    }
+    let pool_cleanup = pool.clone();
+    tokio::spawn(async move {
+        let mut cleanup_tick = interval(Duration::from_secs(3600));
+        cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            cleanup_tick.tick().await;
+            cleanup_old_data(&pool_cleanup).await;
+        }
+    });
 }
 
 async fn is_online(client: &reqwest::Client) -> bool {
