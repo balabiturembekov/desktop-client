@@ -269,6 +269,39 @@ pub async fn time_actor(
                 match cmd {
                     Some(TimerCommand::Start { project_id }) => {
                         if !running {
+                            // Дополнительное восстановление: на случай если какие-то слоты остались с synced=2
+                            // Это может произойти, если восстановление при старте приложения не сработало
+                            match sqlx::query("UPDATE time_slots SET synced = 0 WHERE synced = 2")
+                                .execute(&pool)
+                                .await
+                            {
+                                Ok(result) => {
+                                    if result.rows_affected() > 0 {
+                                        log::info!(
+                                            "[timer] recovered {} stale stub slots on start",
+                                            result.rows_affected()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("[timer] failed to recover stale slots on start: {}", e);
+                                }
+                            }
+
+                            // Защита от горячей перезагрузки: если stub_slot_id уже существует в памяти,
+                            // финализируем его перед созданием нового, чтобы избежать дублирования.
+                            if let Some(existing_slot_id) = stub_slot_id.take() {
+                                log::warn!(
+                                    "[timer] recovery: finalizing orphaned stub slot {} before new start",
+                                    existing_slot_id
+                                );
+                                // Получаем started_at из базы данных или используем текущее время
+                                let now = Utc::now();
+                                // Поскольку мы не знаем точное started_at, используем now как started_at и ended_at
+                                // Это лучше, чем оставлять незавершённый слот
+                                finalize_slot(&pool, &project_id, Some(existing_slot_id), now, now, &activity).await;
+                            }
+
                             // If the idle window is still open (e.g. user started timer from
                             // the tray menu), close it and re-enable main. The Destroyed handler
                             // in lib.rs also re-enables main, so this is a belt-and-suspenders guard.
